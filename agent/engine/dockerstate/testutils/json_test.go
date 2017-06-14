@@ -26,20 +26,20 @@ import (
 
 func createTestContainer(num int) *api.Container {
 	return &api.Container{
-		Name:          "busybox-" + strconv.Itoa(num),
-		Image:         "busybox:latest",
-		Essential:     true,
-		DesiredStatus: api.ContainerRunning,
+		Name:                "busybox-" + strconv.Itoa(num),
+		Image:               "busybox:latest",
+		Essential:           true,
+		DesiredStatusUnsafe: api.ContainerRunning,
 	}
 }
 
 func createTestTask(arn string, numContainers int) *api.Task {
 	task := &api.Task{
-		Arn:           arn,
-		Family:        arn,
-		Version:       "1",
-		DesiredStatus: api.TaskRunning,
-		Containers:    []*api.Container{},
+		Arn:                 arn,
+		Family:              arn,
+		Version:             "1",
+		DesiredStatusUnsafe: api.TaskRunning,
+		Containers:          []*api.Container{},
 	}
 
 	for i := 0; i < numContainers; i++ {

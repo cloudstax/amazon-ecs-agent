@@ -78,7 +78,7 @@ benchmark-test:
 	. ./scripts/shared_env && go test -run=XX -bench=. $(shell go list ./agent/... | grep -v /vendor/)
 
 # Run our 'test' registry needed for integ and functional tests
-test-registry: netkitten volumes-test squid awscli image-cleanup-test-images
+test-registry: netkitten volumes-test squid awscli image-cleanup-test-images fluentd
 	@./scripts/setup-test-registry
 
 test-in-docker:
@@ -103,7 +103,7 @@ volumes-test:
 
 # TODO, replace this with a build on dockerhub or a mechanism for the
 # functional tests themselves to build this
-.PHONY: squid awscli
+.PHONY: squid awscli fluentd
 squid:
 	cd misc/squid; $(MAKE) $(MFLAGS)
 
@@ -112,6 +112,9 @@ gremlin:
 
 awscli:
 	cd misc/awscli; $(MAKE) $(MFLAGS)
+
+fluentd:
+	cd misc/fluentd; $(MAKE) $(MFLAGS)
 
 image-cleanup-test-images:
 	cd misc/image-cleanup-test-images; $(MAKE) $(MFLAGS)

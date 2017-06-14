@@ -47,6 +47,7 @@ const (
 	logDriverTaskDefinition         = "logdriver-jsonfile"
 	cleanupTaskDefinition           = "nginx"
 	networkModeTaskDefinition       = "network-mode"
+	fluentdLogPath                  = "/tmp/ftslog"
 )
 
 // TestRunManyTasks runs several tasks in short succession and expects them to
@@ -97,55 +98,6 @@ func TestOOMContainer(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// This test addresses a deadlock issue which was noted in GH:313 and fixed
-// in GH:320. It runs a service with 10 containers, waits for cleanup, starts
-// another two instances of that service and ensures that those tasks complete.
-func TestTaskCleanupDoesNotDeadlock(t *testing.T) {
-	// Set the ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION to its lowest permissible value
-	os.Setenv("ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION", "60s")
-	defer os.Unsetenv("ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION")
-
-	agent := RunAgent(t, nil)
-	defer agent.Cleanup()
-
-	// This bug was fixed in v1.8.1
-	agent.RequireVersion(">=1.8.1")
-
-	// Run two Tasks after cleanup, as the deadlock does not consistently occur after
-	// after just one task cleanup cycle.
-	for i := 0; i < 3; i++ {
-
-		// Start a task with ten containers
-		testTask, err := agent.StartTask(t, "ten-containers")
-		require.NoError(t, err, fmt.Sprintf("Cycle %d: There was an error starting the Task", i))
-
-		isTaskRunning, err := agent.WaitRunningViaIntrospection(testTask)
-		require.NoError(t, err, "Waiting for task running failed")
-		require.True(t, isTaskRunning, fmt.Sprintf("Cycle %d: Task should be RUNNING but is not", i))
-
-		// Get the dockerID so we can later check that the container has been cleaned up.
-		dockerId, err := agent.ResolveTaskDockerID(testTask, "1")
-		require.NoError(t, err, fmt.Sprintf("Cycle %d: Error resolving docker id for container in task", i))
-
-		// 2 minutes should be enough for the Task to have completed. If the task has not
-		// completed and is in PENDING, the agent is most likely deadlocked.
-		err = testTask.WaitStopped(2 * time.Minute)
-		require.NoError(t, err, fmt.Sprintf("Cycle %d: Task did not transition into to STOPPED in time", i))
-
-		isTaskStopped, err := agent.WaitStoppedViaIntrospection(testTask)
-		require.NoError(t, err, "Waiting for task stopped failed")
-		require.True(t, isTaskStopped, fmt.Sprintf("Cycle %d: Task should be STOPPED but is not", i))
-
-		// Wait for the tasks to be cleaned up
-		time.Sleep(90 * time.Second)
-
-		// Ensure that tasks are cleaned up. WWe should not be able to describe the
-		// container now since it has been cleaned up.
-		_, err = agent.DockerClient.InspectContainer(dockerId)
-		require.Error(t, err, fmt.Sprintf("Cycle %d: Expected error inspecting container in task.", i))
-	}
-}
-
 func strptr(s string) *string { return &s }
 
 func TestCommandOverrides(t *testing.T) {
@@ -153,7 +105,7 @@ func TestCommandOverrides(t *testing.T) {
 	defer agent.Cleanup()
 
 	task, err := agent.StartTaskWithOverrides(t, "simple-exit", []*ecsapi.ContainerOverride{
-		&ecsapi.ContainerOverride{
+		{
 			Name:    strptr("exit"),
 			Command: []*string{strptr("sh"), strptr("-c"), strptr("exit 21")},
 		},
@@ -484,7 +436,7 @@ func TestTaskIamRolesNetHostMode(t *testing.T) {
 			"ECS_ENABLE_TASK_IAM_ROLE":              "true",
 		},
 		PortBindings: map[docker.Port]map[string]string{
-			"51679/tcp": map[string]string{
+			"51679/tcp": {
 				"HostIP":   "0.0.0.0",
 				"HostPort": "51679",
 			},
@@ -507,7 +459,7 @@ func TestTaskIamRolesDefaultNetworkMode(t *testing.T) {
 			"ECS_ENABLE_TASK_IAM_ROLE": "true",
 		},
 		PortBindings: map[docker.Port]map[string]string{
-			"51679/tcp": map[string]string{
+			"51679/tcp": {
 				"HostIP":   "0.0.0.0",
 				"HostPort": "51679",
 			},
@@ -617,4 +569,70 @@ func TestNetworkModeBridge(t *testing.T) {
 
 	err := networkModeTest(t, agent, "bridge")
 	require.NoError(t, err, "Networking mode bridge testing failed")
+}
+
+// TestFluentdTag tests the fluentd logging driver option "tag"
+func TestFluentdTag(t *testing.T) {
+	// tag was added in docker 1.9.0
+	RequireDockerVersion(t, ">=1.9.0")
+
+	fluentdDriverTest("fluentd-tag", t)
+}
+
+// TestFluentdLogTag tests the fluentd logging driver option "log-tag"
+func TestFluentdLogTag(t *testing.T) {
+	// fluentd was added in docker 1.8.0
+	// and deprecated in 1.12.0
+	RequireDockerVersion(t, ">=1.8.0")
+	RequireDockerVersion(t, "<1.12.0")
+
+	fluentdDriverTest("fluentd-log-tag", t)
+}
+
+func fluentdDriverTest(taskDefinition string, t *testing.T) {
+	agentOptions := AgentOptions{
+		ExtraEnvironment: map[string]string{
+			"ECS_AVAILABLE_LOGGING_DRIVERS": `["fluentd"]`,
+		},
+	}
+	agent := RunAgent(t, &agentOptions)
+	defer agent.Cleanup()
+
+	// fluentd is supported in agnet >=1.5.0
+	agent.RequireVersion(">=1.5.0")
+
+	driverTask, err := agent.StartTask(t, "fluentd-driver")
+	require.NoError(t, err)
+
+	err = driverTask.WaitRunning(2 * time.Minute)
+	require.NoError(t, err)
+
+	testTask, err := agent.StartTask(t, taskDefinition)
+	require.NoError(t, err)
+
+	err = testTask.WaitRunning(2 * time.Minute)
+	assert.NoError(t, err)
+
+	dockerID, err := agent.ResolveTaskDockerID(testTask, "fluentd-test")
+	assert.NoError(t, err, "failed to resolve the container id from agent state")
+
+	container, err := agent.DockerClient.InspectContainer(dockerID)
+	assert.NoError(t, err, "failed to inspect the container")
+
+	logTag := fmt.Sprintf("ecs.%v.%v", strings.Replace(container.Name, "/", "", 1), dockerID)
+
+	// clean up
+	err = testTask.WaitStopped(1 * time.Minute)
+	assert.NoError(t, err, "task failed to be stopped")
+
+	driverTask.Stop()
+	err = driverTask.WaitStopped(1 * time.Minute)
+	assert.NoError(t, err, "task failed to be stopped")
+
+	// Verify the log file existed and also the content contains the expected format
+	err = SearchStrInDir(fluentdLogPath, "ecsfts", "hello, this is fluentd functional test")
+	assert.NoError(t, err, "failed to find the content in the fluent log file")
+
+	err = SearchStrInDir(fluentdLogPath, "ecsfts", logTag)
+	assert.NoError(t, err, "failed to find the log tag specified in the task definition")
 }

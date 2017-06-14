@@ -176,8 +176,8 @@ func TestStatsEngineMetadataInStatsSets(t *testing.T) {
 	engine.containerInstanceArn = defaultContainerInstance
 	engine.addContainer("c1")
 	containerStats := []*ContainerStats{
-		&ContainerStats{22400432, 1839104, parseNanoTime("2015-02-12T21:22:05.131117533Z")},
-		&ContainerStats{116499979, 3649536, parseNanoTime("2015-02-12T21:22:05.232291187Z")},
+		{22400432, 1839104, parseNanoTime("2015-02-12T21:22:05.131117533Z")},
+		{116499979, 3649536, parseNanoTime("2015-02-12T21:22:05.232291187Z")},
 	}
 	containers, _ := engine.tasksToContainers["t1"]
 	for _, statsContainer := range containers {
@@ -238,7 +238,7 @@ func TestStatsEngineTerminalTask(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	defer mockCtrl.Finish()
 	resolver := mock_resolver.NewMockContainerMetadataResolver(mockCtrl)
-	resolver.EXPECT().ResolveTask("c1").Return(&api.Task{Arn: "t1", KnownStatus: api.TaskStopped}, nil)
+	resolver.EXPECT().ResolveTask("c1").Return(&api.Task{Arn: "t1", KnownStatusUnsafe: api.TaskStopped}, nil)
 	engine := NewDockerStatsEngine(&cfg, nil, eventStream("TestStatsEngineTerminalTask"))
 	defer engine.removeAll()
 

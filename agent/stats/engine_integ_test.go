@@ -264,17 +264,17 @@ func TestStatsEngineWithDockerTaskEngine(t *testing.T) {
 		Force: true,
 	})
 	containers := []*api.Container{
-		&api.Container{
+		{
 			Name: "gremlin",
 		},
 	}
 	testTask := api.Task{
-		Arn:           "gremlin-task",
-		DesiredStatus: api.TaskRunning,
-		KnownStatus:   api.TaskRunning,
-		Family:        "test",
-		Version:       "1",
-		Containers:    containers,
+		Arn:                 "gremlin-task",
+		DesiredStatusUnsafe: api.TaskRunning,
+		KnownStatusUnsafe:   api.TaskRunning,
+		Family:              "test",
+		Version:             "1",
+		Containers:          containers,
 	}
 	// Populate Tasks and Container map in the engine.
 	dockerTaskEngine, _ := taskEngine.(*ecsengine.DockerTaskEngine)
@@ -387,18 +387,18 @@ func TestStatsEngineWithDockerTaskEngineMissingRemoveEvent(t *testing.T) {
 		Force: true,
 	})
 	containers := []*api.Container{
-		&api.Container{
-			Name:        "gremlin",
-			KnownStatus: api.ContainerStopped,
+		{
+			Name:              "gremlin",
+			KnownStatusUnsafe: api.ContainerStopped,
 		},
 	}
 	testTask := api.Task{
-		Arn:           "gremlin-task",
-		DesiredStatus: api.TaskRunning,
-		KnownStatus:   api.TaskRunning,
-		Family:        "test",
-		Version:       "1",
-		Containers:    containers,
+		Arn:                 "gremlin-task",
+		DesiredStatusUnsafe: api.TaskRunning,
+		KnownStatusUnsafe:   api.TaskRunning,
+		Family:              "test",
+		Version:             "1",
+		Containers:          containers,
 	}
 	// Populate Tasks and Container map in the engine.
 	dockerTaskEngine, _ := taskEngine.(*ecsengine.DockerTaskEngine)

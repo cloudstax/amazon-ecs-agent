@@ -16,9 +16,11 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/acs/model/ecsacs"
@@ -38,6 +40,77 @@ const (
 	// credentials.
 	awsSDKCredentialsRelativeURIPathEnvironmentVariableName = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
 )
+
+// TaskOverrides are the overrides applied to a task
+type TaskOverrides struct{}
+
+// TaskVolume is a definition of all the volumes available for containers to
+// reference within a task. It must be named.
+type TaskVolume struct {
+	Name   string `json:"name"`
+	Volume HostVolume
+}
+
+// Task is the internal representation of a task in the ECS agent
+type Task struct {
+	// Arn is the unique identifer for the task
+	Arn string
+	// Overrides are the overrides applied to a task
+	Overrides TaskOverrides `json:"-"`
+	// Family is the name of the task definition family
+	Family string
+	// Version is the version of the task definition
+	Version string
+	// Containers are the containers for the task
+	Containers []*Container
+	// Volumes are the volumes for the task
+	Volumes []TaskVolume `json:"volumes"`
+
+	// DesiredStatusUnsafe represents the state where the task should go. Generally,
+	// the desired status is informed by the ECS backend as a result of either
+	// API calls made to ECS or decisions made by the ECS service scheduler.
+	// The DesiredStatusUnsafe is almost always either TaskRunning or TaskStopped.
+	// NOTE: Do not access DesiredStatusUnsafe directly.  Instead, use `UpdateStatus`,
+	// `UpdateDesiredStatus`, `SetDesiredStatus`, and `SetDesiredStatus`.
+	// TODO DesiredStatusUnsafe should probably be private with appropriately written
+	// setter/getter.  When this is done, we need to ensure that the UnmarshalJSON
+	// is handled properly so that the state storage continues to work.
+	DesiredStatusUnsafe TaskStatus `json:"DesiredStatus"`
+	desiredStatusLock   sync.RWMutex
+
+	// KnownStatusUnsafe represents the state where the task is.  This is generally
+	// the minimum of equivalent status types for the containers in the task;
+	// if one container is at ContainerRunning and another is at ContainerPulled,
+	// the task KnownStatusUnsafe would be TaskPulled.
+	// NOTE: Do not access KnownStatusUnsafe directly.  Instead, use `UpdateStatus`,
+	// and `GetKnownStatus`.
+	// TODO KnownStatusUnsafe should probably be private with appropriately written
+	// setter/getter.  When this is done, we need to ensure that the UnmarshalJSON
+	// is handled properly so that the state storage continues to work.
+	KnownStatusUnsafe TaskStatus `json:"KnownStatus"`
+	knownStatusLock   sync.RWMutex
+	// KnownStatusTimeUnsafe captures the time when the KnownStatusUnsafe was last updated.
+	// NOTE: Do not access KnownStatusTime directly, instead use `GetKnownStatusTime`.
+	KnownStatusTimeUnsafe time.Time `json:"KnownTime"`
+	knownStatusTimeLock   sync.RWMutex
+
+	// SentStatusUnsafe represents the last KnownStatusUnsafe that was sent to the ECS SubmitTaskStateChange API.
+	// TODO(samuelkarp) SentStatusUnsafe needs a lock and setters/getters.
+	// TODO SentStatusUnsafe should probably be private with appropriately written
+	// setter/getter.  When this is done, we need to ensure that the UnmarshalJSON
+	// is handled properly so that the state storage continues to work.
+	SentStatusUnsafe TaskStatus `json:"SentStatus"`
+	sentStatusLock   sync.RWMutex
+
+	StartSequenceNumber int64
+	StopSequenceNumber  int64
+
+	// credentialsID is used to set the CredentialsId field for the
+	// IAMRoleCredentials object associated with the task. This id can be
+	// used to look up the credentials for task in the credentials manager
+	credentialsID     string
+	credentialsIDLock sync.RWMutex
+}
 
 // PostUnmarshalTask is run after a task has been unmarshalled, but before it has been
 // run. It is possible it will be subsequently called after that and should be
@@ -84,13 +157,13 @@ func (task *Task) initializeEmptyVolumes() {
 			mountPoints[i] = MountPoint{SourceVolume: volume, ContainerPath: containerPath}
 		}
 		sourceContainer := &Container{
-			Name:          emptyHostVolumeName,
-			Image:         emptyvolume.Image + ":" + emptyvolume.Tag,
-			Command:       []string{emptyvolume.Command}, // Command required, but this only gets created so N/A
-			MountPoints:   mountPoints,
-			Essential:     false,
-			IsInternal:    true,
-			DesiredStatus: ContainerRunning,
+			Name:                emptyHostVolumeName,
+			Image:               emptyvolume.Image + ":" + emptyvolume.Tag,
+			Command:             []string{emptyvolume.Command}, // Command required, but this only gets created so N/A
+			MountPoints:         mountPoints,
+			Essential:           false,
+			IsInternal:          true,
+			DesiredStatusUnsafe: ContainerRunning,
 		}
 		task.Containers = append(task.Containers, sourceContainer)
 	}
@@ -99,7 +172,7 @@ func (task *Task) initializeEmptyVolumes() {
 
 // initializeCredentialsEndpoint sets the credentials endpoint for all containers in a task if needed.
 func (task *Task) initializeCredentialsEndpoint(credentialsManager credentials.Manager) {
-	id := task.GetCredentialsId()
+	id := task.GetCredentialsID()
 	if id == "" {
 		// No credentials set for the task. Do not inject the endpoint environment variable.
 		return
@@ -169,17 +242,6 @@ func (task *Task) UpdateMountPoints(cont *Container, vols map[string]string) {
 	}
 }
 
-// updateContainerDesiredStatus sets all container's desired status's to the
-// task's desired status
-func (task *Task) updateContainerDesiredStatus() {
-	for _, c := range task.Containers {
-		taskDesiredStatus := task.GetDesiredStatus()
-		if c.GetDesiredStatus() < taskDesiredStatus.ContainerStatus() {
-			c.SetDesiredStatus(taskDesiredStatus.ContainerStatus())
-		}
-	}
-}
-
 // updateTaskKnownState updates the given task's status based on its container's status.
 // It updates to the minimum of all containers no matter what
 // It returns a TaskStatus indicating what change occured or TaskStatusNone if
@@ -209,7 +271,7 @@ func (task *Task) updateTaskKnownStatus() (newStatus TaskStatus) {
 	}
 	llog.Debug("Earliest status is " + earliestStatus.String())
 	if task.GetKnownStatus() < earliestStatus.TaskStatus() {
-		task.UpdateKnownStatusAndTime(earliestStatus.TaskStatus())
+		task.SetKnownStatus(earliestStatus.TaskStatus())
 		return task.GetKnownStatus()
 	}
 	return TaskStatusNone
@@ -248,8 +310,8 @@ func (task *Task) dockerConfig(container *Container) (*docker.Config, *DockerCli
 
 	// Convert MB to B
 	dockerMem := int64(container.Memory * 1024 * 1024)
-	if dockerMem != 0 && dockerMem < DOCKER_MINIMUM_MEMORY {
-		dockerMem = DOCKER_MINIMUM_MEMORY
+	if dockerMem != 0 && dockerMem < DockerContainerMinimumMemoryInBytes {
+		dockerMem = DockerContainerMinimumMemoryInBytes
 	}
 
 	var entryPoint []string
@@ -265,7 +327,7 @@ func (task *Task) dockerConfig(container *Container) (*docker.Config, *DockerCli
 		Volumes:      dockerVolumes,
 		Env:          dockerEnv,
 		Memory:       dockerMem,
-		CPUShares:    task.dockerCpuShares(container.CPU),
+		CPUShares:    task.dockerCPUShares(container.CPU),
 	}
 
 	if container.DockerConfig.Config != nil {
@@ -281,16 +343,16 @@ func (task *Task) dockerConfig(container *Container) (*docker.Config, *DockerCli
 	return config, nil
 }
 
+// dockerCPUShares converts containerCPU shares if needed as per the logic stated below:
 // Docker silently converts 0 to 1024 CPU shares, which is probably not what we
 // want.  Instead, we convert 0 to 2 to be closer to expected behavior. The
-// reason for 2 over 1 is that 1 is an invalid value (Linux's choice, not
-// Docker's).
-func (task *Task) dockerCpuShares(containerCpu uint) int64 {
-	if containerCpu <= 1 {
-		log.Debug("Converting CPU shares to allowed minimum of 2", "task", task.Arn, "cpuShares", containerCpu)
+// reason for 2 over 1 is that 1 is an invalid value (Linux's choice, not Docker's).
+func (task *Task) dockerCPUShares(containerCPU uint) int64 {
+	if containerCPU <= 1 {
+		log.Debug("Converting CPU shares to allowed minimum of 2", "task", task.Arn, "cpuShares", containerCPU)
 		return 2
 	}
-	return int64(containerCpu)
+	return int64(containerCPU)
 }
 
 func (task *Task) dockerExposedPorts(container *Container) map[docker.Port]struct{} {
@@ -399,7 +461,7 @@ func (task *Task) dockerPortMap(container *Container) map[docker.Port][]docker.P
 		if existing {
 			dockerPortMap[dockerPort] = append(currentMappings, docker.PortBinding{HostIP: portBindingHostIP, HostPort: strconv.Itoa(int(portBinding.HostPort))})
 		} else {
-			dockerPortMap[dockerPort] = []docker.PortBinding{docker.PortBinding{HostIP: portBindingHostIP, HostPort: strconv.Itoa(int(portBinding.HostPort))}}
+			dockerPortMap[dockerPort] = []docker.PortBinding{{HostIP: portBindingHostIP, HostPort: strconv.Itoa(int(portBinding.HostPort))}}
 		}
 	}
 	return dockerPortMap
@@ -472,6 +534,22 @@ func TaskFromACS(acsTask *ecsacs.Task, envelope *ecsacs.PayloadMessage) (*Task, 
 	return task, nil
 }
 
+// UpdateStatus updates a task's known and desired statuses to be compatible
+// with all of its containers
+// It will return a bool indicating if there was a change
+func (task *Task) UpdateStatus() bool {
+	change := task.updateTaskKnownStatus()
+	// DesiredStatus can change based on a new known status
+	task.UpdateDesiredStatus()
+	return change != TaskStatusNone
+}
+
+// UpdateDesiredStatus sets the known status of the task
+func (task *Task) UpdateDesiredStatus() {
+	task.updateTaskDesiredStatus()
+	task.updateContainerDesiredStatus()
+}
+
 // updateTaskDesiredStatus determines what status the task should properly be at based on its container's statuses
 func (task *Task) updateTaskDesiredStatus() {
 	llog := log.New("task", task)
@@ -487,31 +565,35 @@ func (task *Task) updateTaskDesiredStatus() {
 	}
 }
 
-// UpdateStatus updates a task's known and desired statuses to be compatible
-// with all of its containers
-// It will return a bool indicating if there was a change
-func (task *Task) UpdateStatus() bool {
-	change := task.updateTaskKnownStatus()
-	// DesiredStatus can change based on a new known status
-	task.UpdateDesiredStatus()
-	return change != TaskStatusNone
+// updateContainerDesiredStatus sets all container's desired status's to the
+// task's desired status
+func (task *Task) updateContainerDesiredStatus() {
+	for _, c := range task.Containers {
+		taskDesiredStatus := task.GetDesiredStatus()
+		if c.GetDesiredStatus() < taskDesiredStatus.ContainerStatus() {
+			c.SetDesiredStatus(taskDesiredStatus.ContainerStatus())
+		}
+	}
 }
 
-func (task *Task) UpdateDesiredStatus() {
-	task.updateTaskDesiredStatus()
-	task.updateContainerDesiredStatus()
-}
-
+// SetKnownStatus sets the known status of the task
 func (task *Task) SetKnownStatus(status TaskStatus) {
 	task.setKnownStatus(status)
 	task.updateKnownStatusTime()
 }
 
-// UpdateKnownStatusAndTime updates the KnownStatus and KnownStatusTime
-// of the task
-func (task *Task) UpdateKnownStatusAndTime(status TaskStatus) {
-	task.setKnownStatus(status)
-	task.updateKnownStatusTime()
+func (task *Task) setKnownStatus(status TaskStatus) {
+	task.knownStatusLock.Lock()
+	defer task.knownStatusLock.Unlock()
+
+	task.KnownStatusUnsafe = status
+}
+
+func (task *Task) updateKnownStatusTime() {
+	task.knownStatusTimeLock.Lock()
+	defer task.knownStatusTimeLock.Unlock()
+
+	task.KnownStatusTimeUnsafe = ttime.Now()
 }
 
 // GetKnownStatus gets the KnownStatus of the task
@@ -519,7 +601,7 @@ func (task *Task) GetKnownStatus() TaskStatus {
 	task.knownStatusLock.RLock()
 	defer task.knownStatusLock.RUnlock()
 
-	return task.KnownStatus
+	return task.KnownStatusUnsafe
 }
 
 // GetKnownStatusTime gets the KnownStatusTime of the task
@@ -527,49 +609,39 @@ func (task *Task) GetKnownStatusTime() time.Time {
 	task.knownStatusTimeLock.RLock()
 	defer task.knownStatusTimeLock.RUnlock()
 
-	return task.KnownStatusTime
+	return task.KnownStatusTimeUnsafe
 }
 
-func (task *Task) setKnownStatus(status TaskStatus) {
-	task.knownStatusLock.Lock()
-	defer task.knownStatusLock.Unlock()
-
-	task.KnownStatus = status
-}
-
-func (task *Task) updateKnownStatusTime() {
-	task.knownStatusTimeLock.Lock()
-	defer task.knownStatusTimeLock.Unlock()
-
-	task.KnownStatusTime = ttime.Now()
-}
-
-func (task *Task) SetCredentialsId(id string) {
+// SetCredentialsID sets the credentials ID for the task
+func (task *Task) SetCredentialsID(id string) {
 	task.credentialsIDLock.Lock()
 	defer task.credentialsIDLock.Unlock()
 
 	task.credentialsID = id
 }
 
-func (task *Task) GetCredentialsId() string {
+// GetCredentialsID gets the credentials ID for the task
+func (task *Task) GetCredentialsID() string {
 	task.credentialsIDLock.RLock()
 	defer task.credentialsIDLock.RUnlock()
 
 	return task.credentialsID
 }
 
+// GetDesiredStatus gets the desired status of the task
 func (task *Task) GetDesiredStatus() TaskStatus {
 	task.desiredStatusLock.RLock()
 	defer task.desiredStatusLock.RUnlock()
 
-	return task.DesiredStatus
+	return task.DesiredStatusUnsafe
 }
 
+// SetDesiredStatus sets the desired status of the task
 func (task *Task) SetDesiredStatus(status TaskStatus) {
 	task.desiredStatusLock.Lock()
 	defer task.desiredStatusLock.Unlock()
 
-	task.DesiredStatus = status
+	task.DesiredStatusUnsafe = status
 }
 
 // GetSentStatus safely returns the SentStatus of the task
@@ -577,7 +649,7 @@ func (task *Task) GetSentStatus() TaskStatus {
 	task.sentStatusLock.RLock()
 	defer task.sentStatusLock.RUnlock()
 
-	return task.SentStatus
+	return task.SentStatusUnsafe
 }
 
 // SetSentStatus safely sets the SentStatus of the task
@@ -585,5 +657,15 @@ func (task *Task) SetSentStatus(status TaskStatus) {
 	task.sentStatusLock.Lock()
 	defer task.sentStatusLock.Unlock()
 
-	task.SentStatus = status
+	task.SentStatusUnsafe = status
+}
+
+// String returns a human readable string representation of this object
+func (t *Task) String() string {
+	res := fmt.Sprintf("%s:%s %s, Status: (%s->%s)", t.Family, t.Version, t.Arn, t.GetKnownStatus().String(), t.GetDesiredStatus().String())
+	res += " Containers: ["
+	for _, c := range t.Containers {
+		res += fmt.Sprintf("%s (%s->%s),", c.Name, c.GetKnownStatus().String(), c.GetDesiredStatus().String())
+	}
+	return res + "]"
 }

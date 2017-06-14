@@ -45,10 +45,10 @@ func TestPostUnmarshalWindowsCanonicalPaths(t *testing.T) {
 		Family:        strptr("myFamily"),
 		Version:       strptr("1"),
 		Containers: []*ecsacs.Container{
-			&ecsacs.Container{
+			{
 				Name: strptr("myName"),
 				MountPoints: []*ecsacs.MountPoint{
-					&ecsacs.MountPoint{
+					{
 						ContainerPath: strptr(`C:/Container/Path`),
 						SourceVolume:  strptr("sourceVolume"),
 					},
@@ -56,7 +56,7 @@ func TestPostUnmarshalWindowsCanonicalPaths(t *testing.T) {
 			},
 		},
 		Volumes: []*ecsacs.Volume{
-			&ecsacs.Volume{
+			{
 				Name: strptr("sourceVolume"),
 				Host: &ecsacs.HostVolumeProperties{
 					SourcePath: strptr(`C:/Host/path`),
@@ -65,15 +65,15 @@ func TestPostUnmarshalWindowsCanonicalPaths(t *testing.T) {
 		},
 	}
 	expectedTask := &Task{
-		Arn:           "myArn",
-		DesiredStatus: TaskRunning,
-		Family:        "myFamily",
-		Version:       "1",
+		Arn:                 "myArn",
+		DesiredStatusUnsafe: TaskRunning,
+		Family:              "myFamily",
+		Version:             "1",
 		Containers: []*Container{
-			&Container{
+			{
 				Name: "myName",
 				MountPoints: []MountPoint{
-					MountPoint{
+					{
 						ContainerPath: `c:\container\path`,
 						SourceVolume:  "sourceVolume",
 					},
@@ -81,7 +81,7 @@ func TestPostUnmarshalWindowsCanonicalPaths(t *testing.T) {
 			},
 		},
 		Volumes: []TaskVolume{
-			TaskVolume{
+			{
 				Name: "sourceVolume",
 				Volume: &FSHostVolume{
 					FSSourcePath: `c:\host\path`,
