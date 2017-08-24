@@ -13,7 +13,7 @@
 
 .PHONY: all gobuild static docker release certs test clean netkitten test-registry run-functional-tests gremlin benchmark-test gogenerate run-integ-tests image-cleanup-test-images
 
-all: openmanagedocker
+all: firecampdocker
 
 # Dynamic go build; useful in that it does not have -a so it won't recompile
 # everything every time
@@ -41,12 +41,12 @@ docker: certs build-in-docker
 	@echo "Built Docker image \"amazon/amazon-ecs-agent:make\""
 
 
-# 'openmanagedocker' builds the agent dockerfile from the current sourcecode tree, dirty
+# 'firecampdocker' builds the agent dockerfile from the current sourcecode tree, dirty
 # or not
-openmanagedocker: certs build-in-docker
+firecampdocker: certs build-in-docker
 	@cd scripts && ./create-amazon-ecs-scratch
-	@docker build -f scripts/dockerfiles/Dockerfile.release -t "cloudstax/openmanage-amazon-ecs-agent:latest" .
-	@echo "Built Docker image \"cloudstax/openmanage-amazon-ecs-agent:latest\""
+	@docker build -f scripts/dockerfiles/Dockerfile.release -t "cloudstax/firecamp-amazon-ecs-agent:latest" .
+	@echo "Built Docker image \"cloudstax/firecamp-amazon-ecs-agent:latest\""
 
 
 # 'docker-release' builds the agent from a clean snapshot of the git repo in

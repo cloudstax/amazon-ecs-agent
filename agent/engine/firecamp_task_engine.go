@@ -7,8 +7,8 @@ import (
 	docker "github.com/fsouza/go-dockerclient"
 )
 
-// Define here again to avoid the dependency on githut.com/cloudstax/openmanage
-const volumeDriver = "OpenManageVolumeDriver"
+// Define here again to avoid the dependency on githut.com/cloudstax/firecamp
+const volumeDriver = "firecampvol"
 
 // Create a taskDefinition at AWS ECS console, created one volume, "Name" my-ecs-volume,
 // "Source Path" /test-volume. Then in "Container Definitions", create "Mount Points",
