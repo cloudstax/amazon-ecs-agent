@@ -593,7 +593,10 @@ func (engine *DockerTaskEngine) createContainer(task *api.Task, container *api.C
 	seelog.Infof("firecamp volume creating container name %s, DockerConfig %s, VolumesFrom %s, MountPoints %s, Links %s, container %s", containerName, container.DockerConfig, container.VolumesFrom, container.MountPoints, container.Links, container)
 	seelog.Infof("firecamp volume hostConfig Binds %s, VolumesFrom %s, VolumeDriver %s, hostConfig %s", hostConfig.Binds, hostConfig.VolumesFrom, hostConfig.VolumeDriver, hostConfig)
 
-	hostConfig = AddVolumeDriver(hostConfig, engine.cfg.Cluster, task.Arn, task.Family)
+	hostConfig, vderr := AddVolumeDriver(hostConfig, container, engine.cfg.Cluster, task.Arn, task.Family)
+	if vderr != nil {
+		return DockerContainerMetadata{Error: api.NamedError(vderr)}
+	}
 
 	seelog.Infof("firecamp volume updated hostConfig Binds %s, VolumeDriver %s", hostConfig.Binds, hostConfig.VolumeDriver)
 
