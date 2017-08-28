@@ -15,6 +15,7 @@ package ecsclient
 
 import (
 	"errors"
+	"fmt"
 	"runtime"
 	"strings"
 	"time"
@@ -149,32 +150,35 @@ func (client *APIECSClient) registerContainerInstance(clusterRef string, contain
 		registrationAttributes = append(registrationAttributes, attribute)
 	}
 	registerRequest.Attributes = registrationAttributes
-	instanceIdentityDoc, err := client.ec2metadata.ReadResource(ec2.INSTANCE_IDENTITY_DOCUMENT_RESOURCE)
+	instanceIdentityDoc, err := client.ec2metadata.GetDynamicData(ec2.InstanceIdentityDocumentResource)
 	iidRetrieved := true
 	if err != nil {
 		log.Error("Unable to get instance identity document", "err", err)
 		iidRetrieved = false
-		instanceIdentityDoc = []byte{}
+		instanceIdentityDoc = ""
 	}
-	strIid := string(instanceIdentityDoc)
-	registerRequest.InstanceIdentityDocument = &strIid
+	registerRequest.InstanceIdentityDocument = &instanceIdentityDoc
 
-	instanceIdentitySignature := []byte{}
+	instanceIdentitySignature := ""
 	if iidRetrieved {
-		instanceIdentitySignature, err = client.ec2metadata.ReadResource(ec2.INSTANCE_IDENTITY_DOCUMENT_SIGNATURE_RESOURCE)
+		instanceIdentitySignature, err = client.ec2metadata.GetDynamicData(ec2.InstanceIdentityDocumentSignatureResource)
 		if err != nil {
 			log.Error("Unable to get instance identity signature", "err", err)
 		}
 	}
 
-	strIidSig := string(instanceIdentitySignature)
-	registerRequest.InstanceIdentityDocumentSignature = &strIidSig
+	registerRequest.InstanceIdentityDocumentSignature = &instanceIdentitySignature
 
 	// Micro-optimization, the pointer to this is used multiple times below
 	integerStr := "INTEGER"
 
 	cpu, mem := getCpuAndMemory()
-	mem = mem - int64(client.config.ReservedMemory)
+	remainingMem := mem - int64(client.config.ReservedMemory)
+	if remainingMem < 0 {
+		return "", fmt.Errorf(
+			"api register-container-instance: reserved memory is higher than available memory on the host, total memory: %d, reserved: %d",
+			mem, client.config.ReservedMemory)
+	}
 
 	cpuResource := ecs.Resource{
 		Name:         utils.Strptr("CPU"),
@@ -184,7 +188,7 @@ func (client *APIECSClient) registerContainerInstance(clusterRef string, contain
 	memResource := ecs.Resource{
 		Name:         utils.Strptr("MEMORY"),
 		Type:         &integerStr,
-		IntegerValue: &mem,
+		IntegerValue: &remainingMem,
 	}
 	portResource := ecs.Resource{
 		Name:           utils.Strptr("PORTS"),
@@ -292,17 +296,74 @@ func (client *APIECSClient) SubmitTaskStateChange(change api.TaskStateChange) er
 	}
 
 	status := change.Status.String()
-	_, err := client.submitStateChangeClient.SubmitTaskStateChange(&ecs.SubmitTaskStateChangeInput{
-		Cluster: &client.config.Cluster,
-		Task:    &change.TaskArn,
-		Status:  &status,
-		Reason:  &change.Reason,
-	})
+
+	req := ecs.SubmitTaskStateChangeInput{
+		Cluster: aws.String(client.config.Cluster),
+		Task:    aws.String(change.TaskArn),
+		Status:  aws.String(status),
+		Reason:  aws.String(change.Reason),
+	}
+
+	containerEvents := make([]*ecs.ContainerStateChange, len(change.Containers))
+	for i, containerEvent := range change.Containers {
+		containerEvents[i] = client.buildContainerStateChangePayload(containerEvent)
+	}
+
+	req.Containers = containerEvents
+
+	_, err := client.submitStateChangeClient.SubmitTaskStateChange(&req)
 	if err != nil {
 		log.Warn("Could not submit a task state change", "err", err)
 		return err
 	}
+
 	return nil
+}
+
+func (client *APIECSClient) buildContainerStateChangePayload(change api.ContainerStateChange) *ecs.ContainerStateChange {
+	statechange := &ecs.ContainerStateChange{
+		ContainerName: aws.String(change.ContainerName),
+	}
+
+	if change.Reason != "" {
+		if len(change.Reason) > ecsMaxReasonLength {
+			trimmed := change.Reason[0:ecsMaxReasonLength]
+			statechange.Reason = aws.String(trimmed)
+		} else {
+			statechange.Reason = aws.String(change.Reason)
+		}
+	}
+	status := change.Status
+
+	if status != api.ContainerStopped && status != api.ContainerRunning {
+		seelog.Warnf("Not submitting unsupported upstream container state %s for container %s in task %s",
+			status.String(), change.ContainerName, change.TaskArn)
+		return nil
+	}
+
+	statechange.Status = aws.String(status.String())
+
+	if change.ExitCode != nil {
+		exitCode := int64(aws.IntValue(change.ExitCode))
+		statechange.ExitCode = aws.Int64(exitCode)
+	}
+	networkBindings := make([]*ecs.NetworkBinding, len(change.PortBindings))
+	for i, binding := range change.PortBindings {
+		hostPort := int64(binding.HostPort)
+		containerPort := int64(binding.ContainerPort)
+		bindIP := binding.BindIP
+		protocol := binding.Protocol.String()
+
+		networkBindings[i] = &ecs.NetworkBinding{
+			BindIP:        aws.String(bindIP),
+			ContainerPort: aws.Int64(containerPort),
+			HostPort:      aws.Int64(hostPort),
+			Protocol:      aws.String(protocol),
+		}
+	}
+	statechange.NetworkBindings = networkBindings
+
+	return statechange
 }
 
 func (client *APIECSClient) SubmitContainerStateChange(change api.ContainerStateChange) error {

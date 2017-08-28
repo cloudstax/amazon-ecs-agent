@@ -84,7 +84,7 @@ func setup(cfg *config.Config, t *testing.T) (TaskEngine, func(), credentials.Ma
 	imageManager.SetSaver(statemanager.NewNoopStateManager())
 	taskEngine := NewDockerTaskEngine(cfg, dockerClient, credentialsManager,
 		eventstream.NewEventStream("ENGINEINTEGTEST", context.Background()), imageManager, state)
-	taskEngine.Init()
+	taskEngine.Init(context.TODO())
 	return taskEngine, func() {
 		taskEngine.Shutdown()
 	}, credentialsManager
@@ -141,8 +141,8 @@ func TestHostVolumeMount(t *testing.T) {
 	event = <-stateChangeEvents
 	assert.Equal(t, event.(api.TaskStateChange).Status, api.TaskStopped, "Expected task to be STOPPED")
 
-	assert.NotNil(t, testTask.Containers[0].KnownExitCode, "No exit code found")
-	assert.Equal(t, 42, *testTask.Containers[0].KnownExitCode, "Wrong exit code")
+	assert.NotNil(t, testTask.Containers[0].GetKnownExitCode(), "No exit code found")
+	assert.Equal(t, 42, *testTask.Containers[0].GetKnownExitCode(), "Wrong exit code")
 
 	data, err := ioutil.ReadFile(filepath.Join(tmpPath, "hello-from-container"))
 	assert.Nil(t, err, "Unexpected error")
@@ -178,8 +178,8 @@ func TestEmptyHostVolumeMount(t *testing.T) {
 	event = <-stateChangeEvents
 	assert.Equal(t, event.(api.TaskStateChange).Status, api.TaskStopped, "Expected task to be STOPPED")
 
-	assert.NotNil(t, testTask.Containers[0].KnownExitCode, "No exit code found")
-	assert.Equal(t, 42, *testTask.Containers[0].KnownExitCode, "Wrong exit code, file probably wasn't present")
+	assert.NotNil(t, testTask.Containers[0].GetKnownExitCode(), "No exit code found")
+	assert.Equal(t, 42, *testTask.Containers[0].GetKnownExitCode(), "Wrong exit code, file probably wasn't present")
 }
 
 func TestSweepContainer(t *testing.T) {

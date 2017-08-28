@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"runtime"
 	"runtime/pprof"
+	"sync"
 	"testing"
 	"time"
 
@@ -756,11 +757,14 @@ func TestConnectionIsClosedOnIdle(t *testing.T) {
 	statemanager := statemanager.NewNoopStateManager()
 	taskHandler := eventhandler.NewTaskHandler()
 
+	wait := sync.WaitGroup{}
+	wait.Add(1)
 	mockWsClient := mock_wsclient.NewMockClientServer(ctrl)
 	mockWsClient.EXPECT().SetAnyRequestHandler(gomock.Any()).Do(func(v interface{}) {}).AnyTimes()
 	mockWsClient.EXPECT().AddRequestHandler(gomock.Any()).Do(func(v interface{}) {}).AnyTimes()
 	mockWsClient.EXPECT().Connect().Return(nil)
 	mockWsClient.EXPECT().Serve().Do(func() {
+		wait.Done()
 		// Pretend as if the maximum heartbeatTimeout duration has
 		// been breached while Serving requests
 		time.Sleep(30 * time.Millisecond)
@@ -768,6 +772,7 @@ func TestConnectionIsClosedOnIdle(t *testing.T) {
 
 	connectionClosed := make(chan bool)
 	mockWsClient.EXPECT().Close().Do(func() {
+		wait.Wait()
 		// Record connection closed
 		connectionClosed <- true
 	}).Return(nil)
@@ -837,6 +842,7 @@ func TestHandlerDoesntLeakGoroutines(t *testing.T) {
 			stateManager:         statemanager,
 			taskHandler:          taskHandler,
 			ctx:                  ctx,
+			_heartbeatTimeout:    1 * time.Second,
 			backoff:              utils.NewSimpleBackoff(connectionBackoffMin, connectionBackoffMax, connectionBackoffJitter, connectionBackoffMultiplier),
 			resources:            newSessionResources(credentials.AnonymousCredentials),
 			credentialsManager:   rolecredentials.NewManager(),
@@ -971,7 +977,7 @@ func TestStartSessionHandlesRefreshCredentialsMessages(t *testing.T) {
 		t.Errorf("Mismatch between expected and added credentials id for task, expected: %s, added: %s", credentialsIdInRefreshMessage, credentialsIdFromTask)
 	}
 
-	go server.Close()
+	server.Close()
 	// Cancel context should close the session
 	<-ended
 }
@@ -1055,6 +1061,7 @@ func TestHandlerReconnectsCorrectlySetsSendCredentialsURLParameter(t *testing.T)
 	}
 }
 
+// TODO: replace with gomock
 func startMockAcsServer(t *testing.T, closeWS <-chan bool) (*httptest.Server, chan<- string, <-chan string, <-chan error, error) {
 	serverChan := make(chan string, 1)
 	requestsChan := make(chan string, 1)

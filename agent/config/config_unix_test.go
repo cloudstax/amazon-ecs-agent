@@ -1,5 +1,5 @@
 // +build !windows
-// Copyright 2014-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -54,7 +54,7 @@ func TestConfigDefault(t *testing.T) {
 	assert.Equal(t, uint16(0), cfg.ReservedMemory, "Default reserved memory set incorrectly")
 	assert.Equal(t, 30*time.Second, cfg.DockerStopTimeout, "Default docker stop container timeout set incorrectly")
 	assert.False(t, cfg.PrivilegedDisabled, "Default PrivilegedDisabled set incorrectly")
-	assert.Equal(t, []dockerclient.LoggingDriver{dockerclient.JsonFileDriver}, cfg.AvailableLoggingDrivers, "Default logging drivers set incorrectly")
+	assert.Equal(t, []dockerclient.LoggingDriver{dockerclient.JSONFileDriver}, cfg.AvailableLoggingDrivers, "Default logging drivers set incorrectly")
 	assert.Equal(t, 3*time.Hour, cfg.TaskCleanupWaitDuration, "Default task cleanup wait duration set incorrectly")
 	assert.False(t, cfg.TaskIAMRoleEnabled, "TaskIAMRoleEnabled set incorrectly")
 	assert.False(t, cfg.TaskIAMRoleEnabledForNetworkHost, "TaskIAMRoleEnabledForNetworkHost set incorrectly")
@@ -99,6 +99,7 @@ func TestConfigFromFile(t *testing.T) {
 	assert.Equal(t, cluster, config.Cluster, "cluster name not as expected from file")
 	assert.Equal(t, dockerAuthType, config.EngineAuthType, "docker auth type not as expected from file")
 	assert.Equal(t, dockerAuth, string(config.EngineAuthData.Contents()), "docker auth data not as expected from file")
+	assert.Equal(t, map[string]string{"attribute1": "value1"}, config.InstanceAttributes)
 }
 
 // TestDockerAuthMergeFromFile tests docker auth read from file correctly after merge
@@ -136,6 +137,7 @@ func TestDockerAuthMergeFromFile(t *testing.T) {
 	assert.Equal(t, cluster, config.Cluster, "cluster name not as expected from environment variable")
 	assert.Equal(t, dockerAuthType, config.EngineAuthType, "docker auth type not as expected from file")
 	assert.Equal(t, dockerAuth, string(config.EngineAuthData.Contents()), "docker auth data not as expected from file")
+	assert.Equal(t, map[string]string{"attribute1": "value1"}, config.InstanceAttributes)
 }
 
 // setupDockerAuthConfiguration create a temp file store the configuration

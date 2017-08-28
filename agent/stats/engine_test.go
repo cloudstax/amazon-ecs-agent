@@ -164,16 +164,19 @@ func TestStatsEngineMetadataInStatsSets(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	defer mockCtrl.Finish()
 	resolver := mock_resolver.NewMockContainerMetadataResolver(mockCtrl)
+	mockDockerClient := ecsengine.NewMockDockerClient(mockCtrl)
 	t1 := &api.Task{Arn: "t1", Family: "f1"}
 	resolver.EXPECT().ResolveTask("c1").AnyTimes().Return(t1, nil)
 	resolver.EXPECT().ResolveContainer(gomock.Any()).AnyTimes().Return(&api.DockerContainer{
 		Container: &api.Container{},
 	}, nil)
+	mockDockerClient.EXPECT().Stats(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 
 	engine := NewDockerStatsEngine(&cfg, nil, eventStream("TestStatsEngineMetadataInStatsSets"))
 	engine.resolver = resolver
 	engine.cluster = defaultCluster
 	engine.containerInstanceArn = defaultContainerInstance
+	engine.client = mockDockerClient
 	engine.addContainer("c1")
 	containerStats := []*ContainerStats{
 		{22400432, 1839104, parseNanoTime("2015-02-12T21:22:05.131117533Z")},
@@ -238,10 +241,16 @@ func TestStatsEngineTerminalTask(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	defer mockCtrl.Finish()
 	resolver := mock_resolver.NewMockContainerMetadataResolver(mockCtrl)
-	resolver.EXPECT().ResolveTask("c1").Return(&api.Task{Arn: "t1", KnownStatusUnsafe: api.TaskStopped}, nil)
+	resolver.EXPECT().ResolveTask("c1").Return(&api.Task{
+		Arn:               "t1",
+		KnownStatusUnsafe: api.TaskStopped,
+		Family:            "f1",
+	}, nil)
 	engine := NewDockerStatsEngine(&cfg, nil, eventStream("TestStatsEngineTerminalTask"))
 	defer engine.removeAll()
 
+	engine.cluster = defaultCluster
+	engine.containerInstanceArn = defaultContainerInstance
 	engine.resolver = resolver
 
 	engine.addContainer("c1")

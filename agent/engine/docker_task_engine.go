@@ -48,10 +48,12 @@ const (
 	labelPrefix                  = "com.amazonaws.ecs."
 )
 
-// DockerTaskEngine is an abstraction over the DockerGoClient so that
+// DockerTaskEngine is a state machine for managing a task and its containers
+// in ECS.
+//
+// DockerTaskEngine implements an abstraction over the DockerGoClient so that
 // it does not have to know about tasks, only containers
-// The DockerTaskEngine interacts with docker to implement a task
-// engine
+// The DockerTaskEngine interacts with Docker to implement a TaskEngine
 type DockerTaskEngine struct {
 	// implements TaskEngine
 
@@ -137,9 +139,9 @@ func (engine *DockerTaskEngine) MarshalJSON() ([]byte, error) {
 // Init initializes a DockerTaskEngine such that it may communicate with docker
 // and operate normally.
 // This function must be called before any other function, except serializing and deserializing, can succeed without error.
-func (engine *DockerTaskEngine) Init() error {
+func (engine *DockerTaskEngine) Init(ctx context.Context) error {
 	// TODO, pass in a a context from main from background so that other things can stop us, not just the tests
-	ctx, cancel := context.WithCancel(context.TODO())
+	derivedCtx, cancel := context.WithCancel(ctx)
 	engine.stopEngine = cancel
 
 	// Determine whether the engine can perform concurrent "docker pull" based on docker version
@@ -148,13 +150,13 @@ func (engine *DockerTaskEngine) Init() error {
 	// Open the event stream before we sync state so that e.g. if a container
 	// goes from running to stopped after we sync with it as "running" we still
 	// have the "went to stopped" event pending so we can be up to date.
-	err := engine.openEventstream(ctx)
+	err := engine.openEventstream(derivedCtx)
 	if err != nil {
 		return err
 	}
 	engine.synchronizeState()
 	// Now catch up and start processing new events per normal
-	go engine.handleDockerEvents(ctx)
+	go engine.handleDockerEvents(derivedCtx)
 	engine.initialized = true
 	return nil
 }
@@ -167,7 +169,7 @@ func (engine *DockerTaskEngine) SetDockerClient(client DockerClient) {
 }
 
 // MustInit blocks and retries until an engine can be initialized.
-func (engine *DockerTaskEngine) MustInit() {
+func (engine *DockerTaskEngine) MustInit(ctx context.Context) {
 	if engine.initialized {
 		return
 	}
@@ -180,7 +182,7 @@ func (engine *DockerTaskEngine) MustInit() {
 		if engine.initialized {
 			return nil
 		}
-		err := engine.Init()
+		err := engine.Init(ctx)
 		if err != nil {
 			errorOnce.Do(func() {
 				log.Error("Could not connect to docker daemon", "err", err)
@@ -371,7 +373,7 @@ func (engine *DockerTaskEngine) emitContainerEvent(task *api.Task, cont *api.Con
 		TaskArn:       task.Arn,
 		ContainerName: cont.Name,
 		Status:        contKnownStatus,
-		ExitCode:      cont.KnownExitCode,
+		ExitCode:      cont.GetKnownExitCode(),
 		PortBindings:  cont.KnownPortBindings,
 		Reason:        reason,
 		Container:     cont,
@@ -407,6 +409,11 @@ func (engine *DockerTaskEngine) handleDockerEvents(ctx context.Context) {
 	}
 }
 
+// handleDockerEvent is the entrypoint for task modifications originating with
+// events occurring through Docker, outside the task engine itself.
+// handleDockerEvent is responsible for taking an event that correlates to a
+// container and placing it in the context of the task to which that container
+// belongs.
 func (engine *DockerTaskEngine) handleDockerEvent(event DockerContainerChangeEvent) bool {
 	log.Debug("Handling a docker event", "event", event)
 
@@ -471,6 +478,7 @@ func (engine *DockerTaskEngine) AddTask(task *api.Task) error {
 
 type transitionApplyFunc (func(*api.Task, *api.Container) DockerContainerMetadata)
 
+// tryApplyTransition wraps the transitionApplyFunc provided
 func tryApplyTransition(task *api.Task, container *api.Container, to api.ContainerStatus, f transitionApplyFunc) DockerContainerMetadata {
 	return f(task, container)
 }
@@ -695,6 +703,9 @@ func (engine *DockerTaskEngine) updateTask(task *api.Task, update *api.Task) {
 	log.Debug("Update was taken off the acs channel", "task", task.Arn, "status", updateDesiredStatus)
 }
 
+// transitionFunctionMap provides the logic for the simple state machine of the
+// DockerTaskEngine. Each desired state maps to a function that can be called
+// to try and move the task to that desired state.
 func (engine *DockerTaskEngine) transitionFunctionMap() map[api.ContainerStatus]transitionApplyFunc {
 	return map[api.ContainerStatus]transitionApplyFunc{
 		api.ContainerPulled:  engine.pullContainer,
@@ -704,7 +715,8 @@ func (engine *DockerTaskEngine) transitionFunctionMap() map[api.ContainerStatus]
 	}
 }
 
-// applyContainerState moves the container to the given state
+// applyContainerState moves the container to the given state by calling the
+// function defined in the transitionFunctionMap for the state
 func (engine *DockerTaskEngine) applyContainerState(task *api.Task, container *api.Container, nextState api.ContainerStatus) DockerContainerMetadata {
 	clog := log.New("task", task, "container", container)
 	transitionFunction, ok := engine.transitionFunctionMap()[nextState]
@@ -723,6 +735,9 @@ func (engine *DockerTaskEngine) applyContainerState(task *api.Task, container *a
 	return metadata
 }
 
+// transitionContainer calls applyContainerState, and then notifies the managed
+// task of the change.  transitionContainer is called by progressContainers and
+// by handleStoppedToRunningContainerTransition.
 func (engine *DockerTaskEngine) transitionContainer(task *api.Task, container *api.Container, to api.ContainerStatus) {
 	// Let docker events operate async so that we can continue to handle ACS / other requests
 	// This is safe because 'applyContainerState' will not mutate the task
@@ -772,15 +787,25 @@ func (engine *DockerTaskEngine) Capabilities() []string {
 	if !engine.cfg.PrivilegedDisabled {
 		capabilities = append(capabilities, capabilityPrefix+"privileged-container")
 	}
-	versions := make(map[dockerclient.DockerVersion]bool)
+
+	supportedVersions := make(map[dockerclient.DockerVersion]bool)
+	// Determine API versions to report as supported. Supported versions are also used for capability-enablement, except
+	// logging drivers.
 	for _, version := range engine.client.SupportedVersions() {
 		capabilities = append(capabilities, capabilityPrefix+"docker-remote-api."+string(version))
-		versions[version] = true
+		supportedVersions[version] = true
+	}
+
+	knownVersions := make(map[dockerclient.DockerVersion]struct{})
+	// Determine known API versions. Known versions are used exclusively for logging-driver enablement, since none of
+	// the structural API elements change.
+	for _, version := range engine.client.KnownVersions() {
+		knownVersions[version] = struct{}{}
 	}
 
 	for _, loggingDriver := range engine.cfg.AvailableLoggingDrivers {
 		requiredVersion := dockerclient.LoggingDriverMinimumVersion[loggingDriver]
-		if _, ok := versions[requiredVersion]; ok {
+		if _, ok := knownVersions[requiredVersion]; ok {
 			capabilities = append(capabilities, capabilityPrefix+"logging-driver."+string(loggingDriver))
 		}
 	}
@@ -792,15 +817,15 @@ func (engine *DockerTaskEngine) Capabilities() []string {
 		capabilities = append(capabilities, capabilityPrefix+"apparmor")
 	}
 
-	if _, ok := versions[dockerclient.Version_1_19]; ok {
+	if _, ok := supportedVersions[dockerclient.Version_1_19]; ok {
 		capabilities = append(capabilities, capabilityPrefix+"ecr-auth")
 	}
 
 	if engine.cfg.TaskIAMRoleEnabled {
 		// The "task-iam-role" capability is supported for docker v1.7.x onwards
 		// Refer https://github.com/docker/docker/blob/master/docs/reference/api/docker_remote_api.md
-		// to lookup the table of docker versions to API versions
-		if _, ok := versions[dockerclient.Version_1_19]; ok {
+		// to lookup the table of docker supportedVersions to API supportedVersions
+		if _, ok := supportedVersions[dockerclient.Version_1_19]; ok {
 			capabilities = append(capabilities, capabilityPrefix+capabilityTaskIAMRole)
 		} else {
 			seelog.Warn("Task IAM Role not enabled due to unsuppported Docker version")
@@ -809,7 +834,7 @@ func (engine *DockerTaskEngine) Capabilities() []string {
 
 	if engine.cfg.TaskIAMRoleEnabledForNetworkHost {
 		// The "task-iam-role-network-host" capability is supported for docker v1.7.x onwards
-		if _, ok := versions[dockerclient.Version_1_19]; ok {
+		if _, ok := supportedVersions[dockerclient.Version_1_19]; ok {
 			capabilities = append(capabilities, capabilityPrefix+capabilityTaskIAMRoleNetHost)
 		} else {
 			seelog.Warn("Task IAM Role for Host Network not enabled due to unsuppported Docker version")

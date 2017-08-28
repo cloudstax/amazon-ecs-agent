@@ -15,6 +15,7 @@ package eventhandler
 
 import (
 	"github.com/aws/amazon-ecs-agent/agent/api"
+	"sync"
 )
 
 // a state change that may have a container and, optionally, a task event to
@@ -28,9 +29,14 @@ type sendableEvent struct {
 
 	taskSent   bool
 	taskChange api.TaskStateChange
+
+	lock sync.RWMutex
 }
 
-func (event sendableEvent) String() string {
+func (event *sendableEvent) String() string {
+	event.lock.RLock()
+	defer event.lock.RUnlock()
+
 	if event.isContainerEvent {
 		return "ContainerChange: " + event.containerChange.String()
 	} else {
@@ -62,6 +68,8 @@ func (event *sendableEvent) taskArn() string {
 }
 
 func (event *sendableEvent) taskShouldBeSent() bool {
+	event.lock.RLock()
+	defer event.lock.RUnlock()
 	if event.isContainerEvent {
 		return false
 	}
@@ -76,6 +84,8 @@ func (event *sendableEvent) taskShouldBeSent() bool {
 }
 
 func (event *sendableEvent) containerShouldBeSent() bool {
+	event.lock.RLock()
+	defer event.lock.RUnlock()
 	if !event.isContainerEvent {
 		return false
 	}
@@ -84,4 +94,14 @@ func (event *sendableEvent) containerShouldBeSent() bool {
 		return false
 	}
 	return true
+}
+
+func (event *sendableEvent) setSent() {
+	event.lock.Lock()
+	defer event.lock.Unlock()
+	if event.isContainerEvent {
+		event.containerSent = true
+	} else {
+		event.taskSent = true
+	}
 }
