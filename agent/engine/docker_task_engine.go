@@ -639,7 +639,7 @@ func (engine *DockerTaskEngine) createContainer(task *api.Task, container *api.C
 		dockerContainerName = "ecs-" + task.Family + "-" + task.Version + "-" + name + "-" + utils.RandHex()
 
 		seelog.Infof("firecamp volume task.Family %s, task.Version %s, task %s", task.Family, task.Version, task)
-		seelog.Infof("firecamp volume creating container name %s, DockerConfig %s, VolumesFrom %s, MountPoints %s, Links %s, container %s", containerName, container.DockerConfig, container.VolumesFrom, container.MountPoints, container.Links, container)
+		seelog.Infof("firecamp volume creating container name %s, DockerConfig %s, VolumesFrom %s, MountPoints %s, Links %s, container %s", dockerContainerName, container.DockerConfig, container.VolumesFrom, container.MountPoints, container.Links, container)
 		seelog.Infof("firecamp volume hostConfig Binds %s, VolumesFrom %s, VolumeDriver %s, hostConfig %s", hostConfig.Binds, hostConfig.VolumesFrom, hostConfig.VolumeDriver, hostConfig)
 
 		hostConfig, vderr := AddVolumeDriver(hostConfig, container, engine.cfg.Cluster, task.Arn, task.Family)
