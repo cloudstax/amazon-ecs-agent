@@ -14,41 +14,29 @@
 package eventhandler
 
 import (
-	"errors"
+	"container/list"
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/api/mocks"
 	"github.com/aws/amazon-ecs-agent/agent/statechange"
+	"github.com/aws/amazon-ecs-agent/agent/statemanager"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
 	"github.com/golang/mock/gomock"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 )
-
-func containerEvent(arn string) statechange.Event {
-	return api.ContainerStateChange{TaskArn: arn, ContainerName: "containerName", Status: api.ContainerRunning, Container: &api.Container{}}
-}
-
-func containerEventStopped(arn string) statechange.Event {
-	return api.ContainerStateChange{TaskArn: arn, ContainerName: "containerName", Status: api.ContainerStopped, Container: &api.Container{}}
-}
-
-func taskEvent(arn string) statechange.Event {
-	return api.TaskStateChange{TaskArn: arn, Status: api.TaskRunning, Task: &api.Task{}}
-}
-
-func taskEventStopped(arn string) statechange.Event {
-	return api.TaskStateChange{TaskArn: arn, Status: api.TaskStopped, Task: &api.Task{}}
-}
 
 func TestSendsEventsOneContainer(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	client := mock_api.NewMockECSClient(ctrl)
+	stateManager := statemanager.NewNoopStateManager()
 
-	handler := NewTaskHandler()
+	handler := NewTaskHandler(stateManager)
 	taskarn := "taskarn"
 
 	var wg sync.WaitGroup
@@ -77,8 +65,9 @@ func TestSendsEventsOneEventRetries(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	client := mock_api.NewMockECSClient(ctrl)
+	stateManager := statemanager.NewNoopStateManager()
 
-	handler := NewTaskHandler()
+	handler := NewTaskHandler(stateManager)
 	taskarn := "taskarn"
 
 	var wg sync.WaitGroup
@@ -101,8 +90,9 @@ func TestSendsEventsConcurrentLimit(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	client := mock_api.NewMockECSClient(ctrl)
+	stateManager := statemanager.NewNoopStateManager()
 
-	handler := NewTaskHandler()
+	handler := NewTaskHandler(stateManager)
 
 	completeStateChange := make(chan bool, concurrentEventCalls+1)
 	var wg sync.WaitGroup
@@ -137,8 +127,9 @@ func TestSendsEventsContainerDifferences(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	client := mock_api.NewMockECSClient(ctrl)
+	stateManager := statemanager.NewNoopStateManager()
 
-	handler := NewTaskHandler()
+	handler := NewTaskHandler(stateManager)
 	taskarn := "taskarn"
 
 	var wg sync.WaitGroup
@@ -169,8 +160,9 @@ func TestSendsEventsTaskDifferences(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	client := mock_api.NewMockECSClient(ctrl)
+	stateManager := statemanager.NewNoopStateManager()
 
-	handler := NewTaskHandler()
+	handler := NewTaskHandler(stateManager)
 	taskarnA := "taskarnA"
 	taskarnB := "taskarnB"
 
@@ -189,13 +181,13 @@ func TestSendsEventsTaskDifferences(t *testing.T) {
 	taskEventB := taskEventStopped(taskarnB)
 
 	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
-		assert.Equal(t, taskarnA, change.TaskArn)
+		assert.Equal(t, taskarnA, change.TaskARN)
 		wgAddEvent.Done()
 		wg.Done()
 	})
 
 	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
-		assert.Equal(t, taskarnB, change.TaskArn)
+		assert.Equal(t, taskarnB, change.TaskARN)
 		wg.Done()
 	})
 
@@ -215,8 +207,9 @@ func TestSendsEventsDedupe(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	client := mock_api.NewMockECSClient(ctrl)
+	stateManager := statemanager.NewNoopStateManager()
 
-	handler := NewTaskHandler()
+	handler := NewTaskHandler(stateManager)
 	taskarnA := "taskarnA"
 	taskarnB := "taskarnB"
 
@@ -241,7 +234,7 @@ func TestSendsEventsDedupe(t *testing.T) {
 	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(func(change api.TaskStateChange) {
 		assert.Equal(t, 1, len(change.Containers))
 		assert.Equal(t, taskarnB, change.Containers[0].TaskArn)
-		assert.Equal(t, taskarnB, change.TaskArn)
+		assert.Equal(t, taskarnB, change.TaskARN)
 		wg.Done()
 	})
 
@@ -249,6 +242,39 @@ func TestSendsEventsDedupe(t *testing.T) {
 	handler.AddStateChangeEvent(task2, client)
 
 	wg.Wait()
+}
+
+// TestCleanupTaskEventAfterSubmit tests the map of task event is removed after
+// calling submittaskstatechange
+func TestCleanupTaskEventAfterSubmit(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	stateManager := statemanager.NewNoopStateManager()
+	client := mock_api.NewMockECSClient(ctrl)
+
+	handler := NewTaskHandler(stateManager)
+	taskarn := "taskarn"
+	taskarn2 := "taskarn2"
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+
+	taskEvent1 := taskEvent(taskarn)
+	taskEvent2 := taskEvent(taskarn)
+	taskEvent3 := taskEvent(taskarn2)
+
+	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Do(
+		func(change api.TaskStateChange) {
+			wg.Done()
+		}).Times(3)
+
+	handler.AddStateChangeEvent(taskEvent1, client)
+	handler.AddStateChangeEvent(taskEvent2, client)
+	handler.AddStateChangeEvent(taskEvent3, client)
+
+	wg.Wait()
+	assert.Len(t, handler.tasksToEvents, 0)
 }
 
 func TestShouldBeSent(t *testing.T) {
@@ -263,4 +289,58 @@ func TestShouldBeSent(t *testing.T) {
 	if !sendableEvent.containerShouldBeSent() {
 		t.Error("Container should be sent if it's the first try")
 	}
+}
+
+func containerEvent(arn string) statechange.Event {
+	return api.ContainerStateChange{TaskArn: arn, ContainerName: "containerName", Status: api.ContainerRunning, Container: &api.Container{}}
+}
+
+func containerEventStopped(arn string) statechange.Event {
+	return api.ContainerStateChange{TaskArn: arn, ContainerName: "containerName", Status: api.ContainerStopped, Container: &api.Container{}}
+}
+
+func taskEvent(arn string) statechange.Event {
+	return api.TaskStateChange{TaskARN: arn, Status: api.TaskRunning, Task: &api.Task{}}
+}
+
+func taskEventStopped(arn string) statechange.Event {
+	return api.TaskStateChange{TaskARN: arn, Status: api.TaskStopped, Task: &api.Task{}}
+}
+
+func TestENISentStatusChange(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	client := mock_api.NewMockECSClient(ctrl)
+
+	task := &api.Task{
+		Arn: "taskarn",
+	}
+
+	eniAttachment := &api.ENIAttachment{
+		TaskARN:          "taskarn",
+		AttachStatusSent: false,
+		ExpiresAt:        time.Now().Add(time.Second),
+	}
+	timeoutFunc := func() {
+		eniAttachment.AttachStatusSent = true
+	}
+	assert.NoError(t, eniAttachment.StartTimer(timeoutFunc))
+
+	sendableTaskEvent := newSendableTaskEvent(api.TaskStateChange{
+		Attachment: eniAttachment,
+		TaskARN:    "taskarn",
+		Status:     api.TaskStatusNone,
+		Task:       task,
+	})
+
+	client.EXPECT().SubmitTaskStateChange(gomock.Any()).Return(nil)
+
+	events := list.New()
+	events.PushBack(sendableTaskEvent)
+	handler := NewTaskHandler(statemanager.NewNoopStateManager())
+	handler.SubmitTaskEvents(&eventList{
+		events: events,
+	}, client)
+
+	assert.True(t, eniAttachment.AttachStatusSent)
 }
