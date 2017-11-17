@@ -25,6 +25,7 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/app/factory"
 	"github.com/aws/amazon-ecs-agent/agent/app/oswrapper"
 	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/agent/containermetadata"
 	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/ec2"
 	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
@@ -70,6 +71,9 @@ var (
 type agent interface {
 	// printVersion prints the Agent version string
 	printVersion() int
+	// printECSAttributes prints the Agent's capabilities based on
+	// its environment
+	printECSAttributes() int
 	// start starts the Agent execution
 	start() int
 }
@@ -92,6 +96,7 @@ type ecsAgent struct {
 	vpc                   string
 	subnet                string
 	mac                   string
+	metadataManager       containermetadata.Manager
 }
 
 // newAgent returns a new ecsAgent object
@@ -126,6 +131,14 @@ func newAgent(
 		return nil, err
 	}
 
+	var metadataManager containermetadata.Manager
+	if cfg.ContainerMetadataEnabled {
+		// We use the default API client for the metadata inspect call. This version has some information
+		// missing which means if we need those fields later we will need to change this client to
+		// the appropriate version
+		metadataManager = containermetadata.NewManager(dockerClient, cfg)
+	}
+
 	return &ecsAgent{
 		ctx:               ctx,
 		ec2MetadataClient: ec2MetadataClient,
@@ -142,13 +155,23 @@ func newAgent(
 			PluginsPath:            cfg.CNIPluginsPath,
 			MinSupportedCNIVersion: config.DefaultMinSupportedCNIVersion,
 		}),
-		os: oswrapper.New(),
+		os:              oswrapper.New(),
+		metadataManager: metadataManager,
 	}, nil
 }
 
 // printVersion prints the ECS Agent version string
 func (agent *ecsAgent) printVersion() int {
 	version.PrintVersion(agent.dockerClient)
+	return exitcodes.ExitSuccess
+}
+
+// printECSAttributes prints the Agent's ECS Attributes based on its
+// environment
+func (agent *ecsAgent) printECSAttributes() int {
+	for _, attr := range agent.capabilities() {
+		fmt.Printf("%s\t%s\n", aws.StringValue(attr.Name), aws.StringValue(attr.Value))
+	}
 	return exitcodes.ExitSuccess
 }
 
@@ -224,6 +247,10 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 		}
 		return exitcodes.ExitTerminal
 	}
+	// Add container instance ARN to metadata manager
+	if agent.cfg.ContainerMetadataEnabled {
+		agent.metadataManager.SetContainerInstanceARN(agent.containerInstanceARN)
+	}
 
 	// Begin listening to the docker daemon and saving changes
 	taskEngine.SetSaver(stateManager)
@@ -234,7 +261,7 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 	deregisterInstanceEventStream := eventstream.NewEventStream(
 		deregisterContainerInstanceEventStreamName, agent.ctx)
 	deregisterInstanceEventStream.StartListening()
-	taskHandler := eventhandler.NewTaskHandler(stateManager)
+	taskHandler := eventhandler.NewTaskHandler(agent.ctx, stateManager, state, client)
 	agent.startAsyncRoutines(containerChangeEventStream, credentialsManager, imageManager,
 		taskEngine, stateManager, deregisterInstanceEventStream, client, taskHandler)
 
@@ -255,13 +282,13 @@ func (agent *ecsAgent) newTaskEngine(containerChangeEventStream *eventstream.Eve
 	if !agent.cfg.Checkpoint {
 		seelog.Info("Checkpointing not enabled; a new container instance will be created each time the agent is run")
 		return engine.NewTaskEngine(agent.cfg, agent.dockerClient,
-			credentialsManager, containerChangeEventStream, imageManager, state), "", nil
+			credentialsManager, containerChangeEventStream, imageManager, state, agent.metadataManager), "", nil
 	}
 
 	// We try to set these values by loading the existing state file first
 	var previousCluster, previousEC2InstanceID, previousContainerInstanceArn string
 	previousTaskEngine := engine.NewTaskEngine(agent.cfg, agent.dockerClient,
-		credentialsManager, containerChangeEventStream, imageManager, state)
+		credentialsManager, containerChangeEventStream, imageManager, state, agent.metadataManager)
 
 	// previousState is used to verify that our current runtime configuration is
 	// compatible with our past configuration as reflected by our state-file
@@ -287,7 +314,7 @@ func (agent *ecsAgent) newTaskEngine(containerChangeEventStream *eventstream.Eve
 		state.Reset()
 		// Reset taskEngine; all the other values are still default
 		return engine.NewTaskEngine(agent.cfg, agent.dockerClient, credentialsManager,
-			containerChangeEventStream, imageManager, state), currentEC2InstanceID, nil
+			containerChangeEventStream, imageManager, state, agent.metadataManager), currentEC2InstanceID, nil
 	}
 
 	if previousCluster != "" {
@@ -298,6 +325,7 @@ func (agent *ecsAgent) newTaskEngine(containerChangeEventStream *eventstream.Eve
 
 	// Use the values we loaded if there's no issue
 	agent.containerInstanceARN = previousContainerInstanceArn
+
 	return previousTaskEngine, currentEC2InstanceID, nil
 }
 

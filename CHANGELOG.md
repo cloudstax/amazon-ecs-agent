@@ -1,13 +1,29 @@
-# Changelog
+#Changelog
 
-## UNRELEASED
-* Feature - Support for provisioning Tasks with ENIs
+## 1.15.1
+* Bug - Fixed a bug where container state information wasn't reported. [#1067](https://github.com/aws/amazon-ecs-agent/pull/1067)
+* Bug - Fixed a bug where a task can be blocked in creating state. [#1048](https://github.com/aws/amazon-ecs-agent/pull/1048)
+* Bug - Fixed dynamic HostPort in container metadata. [#1052](https://github.com/aws/amazon-ecs-agent/pull/1052)
+
+## 1.15.0
+* Feature - Support for provisioning tasks with ENIs.
+* Feature - Support for `--init` Docker run flag. [#996](https://github.com/aws/amazon-ecs-agent/pull/996)
+* Feature - Introduces container level metadata. [#981](https://github.com/aws/amazon-ecs-agent/pull/981)
+* Enhancement - Enable 'none' logging driver capability by default.
+  [#1041](https://github.com/aws/amazon-ecs-agent/pull/1041)
+* Bug - Fixed a bug where tasks that fail to pull containers can cause the agent
+  to fail to restore properly after a restart. [#1033](https://github.com/aws/amazon-ecs-agent/pull/1033)
+* Bug - Fixed default logging level issue. [#1016](https://github.com/aws/amazon-ecs-agent/pull/1016)
+* Bug - Fixed a bug where unsupported Docker API client versions could be registered.
+  [#1014](https://github.com/aws/amazon-ecs-agent/pull/1014)
+* Bug - Fixed a bug where non-essential container state changes were sometimes not submitted.
+  [#1026](https://github.com/aws/amazon-ecs-agent/pull/1026) 
 
 ## 1.14.5
 * Enhancement - Retry failed container image pull operations [#975](https://github.com/aws/amazon-ecs-agent/pull/975)
 * Enhancement - Set read and write timeouts for websocket connectons [#993](https://github.com/aws/amazon-ecs-agent/pull/993)
 * Enhancement - Add support for the SumoLogic Docker log driver plugin
-  [#992](https://github.com/aws/amazon-ecs-agent/pull/992) 
+  [#992](https://github.com/aws/amazon-ecs-agent/pull/992)
 * Bug - Fixed a memory leak issue when submitting the task state change [#967](https://github.com/aws/amazon-ecs-agent/pull/967)
 * Bug - Fixed a race condition where a container can be created twice when agent restarts. [#939](https://github.com/aws/amazon-ecs-agent/pull/939)
 * Bug - Fixed an issue where `microsoft/windowsservercore:latest` was not

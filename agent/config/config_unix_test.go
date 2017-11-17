@@ -49,6 +49,7 @@ func TestConfigDefault(t *testing.T) {
 	os.Unsetenv("ECS_ENABLE_TASK_ENI")
 	os.Unsetenv("ECS_CNI_PLUGINS_PATH")
 	os.Unsetenv("ECS_AWSVPC_BLOCK_IMDS")
+	os.Unsetenv("ECS_HOST_DATA_DIR")
 
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	assert.NoError(t, err)
@@ -60,7 +61,8 @@ func TestConfigDefault(t *testing.T) {
 	assert.Equal(t, uint16(0), cfg.ReservedMemory, "Default reserved memory set incorrectly")
 	assert.Equal(t, 30*time.Second, cfg.DockerStopTimeout, "Default docker stop container timeout set incorrectly")
 	assert.False(t, cfg.PrivilegedDisabled, "Default PrivilegedDisabled set incorrectly")
-	assert.Equal(t, []dockerclient.LoggingDriver{dockerclient.JSONFileDriver}, cfg.AvailableLoggingDrivers, "Default logging drivers set incorrectly")
+	assert.Equal(t, []dockerclient.LoggingDriver{dockerclient.JSONFileDriver, dockerclient.NoneDriver},
+		cfg.AvailableLoggingDrivers, "Default logging drivers set incorrectly")
 	assert.Equal(t, 3*time.Hour, cfg.TaskCleanupWaitDuration, "Default task cleanup wait duration set incorrectly")
 	assert.False(t, cfg.TaskENIEnabled, "TaskENIEnabled set incorrectly")
 	assert.False(t, cfg.TaskIAMRoleEnabled, "TaskIAMRoleEnabled set incorrectly")
@@ -73,6 +75,7 @@ func TestConfigDefault(t *testing.T) {
 	assert.Equal(t, DefaultNumImagesToDeletePerCycle, cfg.NumImagesToDeletePerCycle, "NumImagesToDeletePerCycle default is set incorrectly")
 	assert.Equal(t, defaultCNIPluginsPath, cfg.CNIPluginsPath, "CNIPluginsPath default is set incorrectly")
 	assert.False(t, cfg.AWSVPCBlockInstanceMetdata, "AWSVPCBlockInstanceMetdata default is incorrectly set")
+	assert.Equal(t, "/var/lib/ecs", cfg.DataDirOnHost, "Default DataDirOnHost set incorrectly")
 }
 
 // TestConfigFromFile tests the configuration can be read from file

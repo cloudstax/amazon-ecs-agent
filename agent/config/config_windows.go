@@ -44,6 +44,7 @@ const (
 func DefaultConfig() Config {
 	programData := utils.DefaultIfBlank(os.Getenv("ProgramData"), `C:\ProgramData`)
 	ecsRoot := filepath.Join(programData, "Amazon", "ECS")
+	dataDir := filepath.Join(ecsRoot, "data")
 	return Config{
 		DockerEndpoint: "npipe:////./pipe/docker_engine",
 		ReservedPorts: []uint16{
@@ -59,11 +60,14 @@ func DefaultConfig() Config {
 			netBIOSPort,
 		},
 		ReservedPortsUDP: []uint16{},
-		DataDir:          filepath.Join(ecsRoot, "data"),
+		DataDir:          dataDir,
+		// DataDirOnHost is identical to DataDir for Windows because we do not
+		// run as a container
+		DataDirOnHost: dataDir,
 		// DisableMetrics is set to true on Windows as docker stats does not work
 		DisableMetrics:              true,
 		ReservedMemory:              0,
-		AvailableLoggingDrivers:     []dockerclient.LoggingDriver{dockerclient.JSONFileDriver},
+		AvailableLoggingDrivers:     []dockerclient.LoggingDriver{dockerclient.JSONFileDriver, dockerclient.NoneDriver},
 		TaskCleanupWaitDuration:     DefaultTaskCleanupWaitDuration,
 		DockerStopTimeout:           DefaultDockerStopTimeout,
 		CredentialsAuditLogFile:     filepath.Join(ecsRoot, defaultCredentialsAuditLogFile),
@@ -72,6 +76,7 @@ func DefaultConfig() Config {
 		MinimumImageDeletionAge:     DefaultImageDeletionAge,
 		ImageCleanupInterval:        DefaultImageCleanupTimeInterval,
 		NumImagesToDeletePerCycle:   DefaultNumImagesToDeletePerCycle,
+		ContainerMetadataEnabled:    false,
 	}
 }
 

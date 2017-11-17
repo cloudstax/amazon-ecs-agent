@@ -385,24 +385,10 @@ func (task *Task) getEarliestKnownTaskStatusForContainers() TaskStatus {
 	return earliest
 }
 
-// Overridden returns a copy of the task with all container's overridden and
-// itself overridden as well
-func (task *Task) Overridden() *Task {
-	result := *task
-	// Task has no overrides currently, just do the containers
-
-	// Shallow copy, take care of the deeper bits too
-	result.Containers = make([]*Container, len(result.Containers))
-	for i, cont := range task.Containers {
-		result.Containers[i] = cont.Overridden()
-	}
-	return &result
-}
-
 // DockerConfig converts the given container in this task to the format of
 // GoDockerClient's 'Config' struct
 func (task *Task) DockerConfig(container *Container) (*docker.Config, *DockerClientConfigError) {
-	return task.Overridden().dockerConfig(container.Overridden())
+	return task.dockerConfig(container)
 }
 
 func (task *Task) dockerConfig(container *Container) (*docker.Config, *DockerClientConfigError) {
@@ -499,7 +485,7 @@ func (task *Task) dockerConfigVolumes(container *Container) (map[string]struct{}
 }
 
 func (task *Task) DockerHostConfig(container *Container, dockerContainerMap map[string]*DockerContainer) (*docker.HostConfig, *HostConfigError) {
-	return task.Overridden().dockerHostConfig(container.Overridden(), dockerContainerMap)
+	return task.dockerHostConfig(container, dockerContainerMap)
 }
 
 func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[string]*DockerContainer) (*docker.HostConfig, *HostConfigError) {
@@ -542,6 +528,12 @@ func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[
 		return hostConfig, nil
 	}
 	hostConfig.NetworkMode = networkMode
+	// Override 'awsvpc' parameters if needed
+	if container.Type == ContainerCNIPause {
+		// Override the DNS settings for the pause container if ENI has custom
+		// DNS settings
+		return task.overrideDNS(hostConfig), nil
+	}
 
 	return hostConfig, nil
 }
@@ -590,6 +582,24 @@ func (task *Task) shouldOverrideNetworkMode(container *Container, dockerContaine
 	return true, networkModeContainerPrefix + pauseContainer.DockerID
 }
 
+// overrideDNS overrides a container's host config if the following conditions are
+// true:
+// 1. Task has an ENI associated with it
+// 2. ENI has custom DNS IPs and search list associated with it
+// This should only be done for the pause container as other containers inherit
+// /etc/resolv.conf of this container (they share the network namespace)
+func (task *Task) overrideDNS(hostConfig *docker.HostConfig) *docker.HostConfig {
+	eni := task.GetTaskENI()
+	if eni == nil {
+		return hostConfig
+	}
+
+	hostConfig.DNS = eni.DomainNameServers
+	hostConfig.DNSSearch = eni.DomainNameSearchList
+
+	return hostConfig
+}
+
 func (task *Task) dockerLinks(container *Container, dockerContainerMap map[string]*DockerContainer) ([]string, error) {
 	dockerLinkArr := make([]string, len(container.Links))
 	for i, link := range container.Links {
@@ -624,9 +634,9 @@ func (task *Task) dockerPortMap(container *Container) map[docker.Port][]docker.P
 		dockerPort := docker.Port(strconv.Itoa(int(portBinding.ContainerPort)) + "/" + portBinding.Protocol.String())
 		currentMappings, existing := dockerPortMap[dockerPort]
 		if existing {
-			dockerPortMap[dockerPort] = append(currentMappings, docker.PortBinding{HostIP: portBindingHostIP, HostPort: strconv.Itoa(int(portBinding.HostPort))})
+			dockerPortMap[dockerPort] = append(currentMappings, docker.PortBinding{HostPort: strconv.Itoa(int(portBinding.HostPort))})
 		} else {
-			dockerPortMap[dockerPort] = []docker.PortBinding{{HostIP: portBindingHostIP, HostPort: strconv.Itoa(int(portBinding.HostPort))}}
+			dockerPortMap[dockerPort] = []docker.PortBinding{{HostPort: strconv.Itoa(int(portBinding.HostPort))}}
 		}
 	}
 	return dockerPortMap
@@ -696,6 +706,13 @@ func TaskFromACS(acsTask *ecsacs.Task, envelope *ecsacs.PayloadMessage) (*Task, 
 		task.StartSequenceNumber = *envelope.SeqNum
 	} else if task.GetDesiredStatus() == TaskStopped && envelope.SeqNum != nil {
 		task.StopSequenceNumber = *envelope.SeqNum
+	}
+
+	// Overrides the container command if it's set
+	for _, container := range task.Containers {
+		if (container.Overrides != ContainerOverrides{}) && container.Overrides.Command != nil {
+			container.Command = *container.Overrides.Command
+		}
 	}
 
 	return task, nil
@@ -848,13 +865,18 @@ func (task *Task) GetTaskENI() *ENI {
 }
 
 // String returns a human readable string representation of this object
-func (t *Task) String() string {
+func (task *Task) String() string {
 	res := fmt.Sprintf("%s:%s %s, TaskStatus: (%s->%s)",
-		t.Family, t.Version, t.Arn,
-		t.GetKnownStatus().String(), t.GetDesiredStatus().String())
+		task.Family, task.Version, task.Arn,
+		task.GetKnownStatus().String(), task.GetDesiredStatus().String())
 	res += " Containers: ["
-	for _, c := range t.Containers {
+	for _, c := range task.Containers {
 		res += fmt.Sprintf("%s (%s->%s),", c.Name, c.GetKnownStatus().String(), c.GetDesiredStatus().String())
+	}
+	task.eniLock.Lock()
+	defer task.eniLock.Unlock()
+	if task.ENI != nil {
+		res += fmt.Sprintf(" ENI: [%s]", task.ENI.String())
 	}
 	return res + "]"
 }

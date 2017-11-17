@@ -42,6 +42,8 @@ const (
 	dockerDefaultTag = "latest"
 	// imageNameFormat is the name of a image may look like: repo:tag
 	imageNameFormat = "%s:%s"
+	// the buffer size will ensure agent doesn't miss any event from docker
+	dockerEventBufferSize = 100
 )
 
 // Timelimits for docker operations enforced above docker
@@ -189,6 +191,7 @@ var scratchCreateLock sync.Mutex
 // NewDockerGoClient creates a new DockerGoClient
 func NewDockerGoClient(clientFactory dockerclient.Factory, cfg *config.Config) (DockerClient, error) {
 	client, err := clientFactory.GetDefaultClient()
+
 	if err != nil {
 		log.Error("Unable to connect to docker daemon. Ensure docker is running.", "err", err)
 		return nil, err
@@ -734,27 +737,29 @@ func (dg *dockerGoClient) ContainerEvents(ctx context.Context) (<-chan DockerCon
 	if err != nil {
 		return nil, err
 	}
+	dockerEvents := make(chan *docker.APIEvents, dockerEventBufferSize)
 	events := make(chan *docker.APIEvents)
+	buffer := NewInfiniteBuffer()
 
-	err = client.AddEventListener(events)
+	err = client.AddEventListener(dockerEvents)
 	if err != nil {
 		log.Error("Unable to add a docker event listener", "err", err)
 		return nil, err
 	}
 	go func() {
 		<-ctx.Done()
-		client.RemoveEventListener(events)
+		client.RemoveEventListener(dockerEvents)
 	}()
+
+	// Cache the event from go docker client
+	go buffer.StartListening(dockerEvents)
+	// Read the buffered events and send to task engine
+	go buffer.Consume(events)
 
 	changedContainers := make(chan DockerContainerChangeEvent)
 
 	go func() {
 		for event := range events {
-			// currently only container events type needs to be handled
-			if event.Type != "container" || event.ID == "" {
-				continue
-			}
-
 			containerID := event.ID
 			log.Debug("Got event from docker daemon", "event", event)
 
@@ -768,23 +773,6 @@ func (dg *dockerGoClient) ContainerEvents(ctx context.Context) (<-chan DockerCon
 				fallthrough
 			case "die":
 				status = api.ContainerStopped
-			case "kill":
-				fallthrough
-			case "rename":
-				// TODO, ensure this wasn't one of our containers. This isn't critical
-				// because we typically have the docker id stored too and a wrong name
-				// won't be fatal once we do
-				continue
-			case "restart":
-			case "resize":
-			case "unpause":
-			case "destroy":
-				// container remove events doesn't need to be handled by ecs agent
-				// as it has already moved to stopped before this event
-				continue
-
-			// These result in us falling through to inspect the container, some
-			// out of caution, some because it's a form of state change
 			case "oom":
 				containerInfo := event.ID
 				// events only contain the container's name in newer Docker API
@@ -797,39 +785,8 @@ func (dg *dockerGoClient) ContainerEvents(ctx context.Context) (<-chan DockerCon
 				// "oom" can either means any process got OOM'd, but doesn't always
 				// mean the container dies (non-init processes). If the container also
 				// dies, you see a "die" status as well; we'll update suitably there
-				fallthrough
-			case "pause":
-				// non image events that aren't of interest currently
-				fallthrough
-			case "exec_create":
-				fallthrough
-			case "exec_start":
-				fallthrough
-			case "top":
-				fallthrough
-			case "attach":
-				fallthrough
-			// image events
-			case "export":
-				fallthrough
-			case "pull":
-				fallthrough
-			case "push":
-				fallthrough
-			case "tag":
-				fallthrough
-			case "untag":
-				fallthrough
-			case "import":
-				fallthrough
-			case "delete":
-				// No interest in image events
 				continue
 			default:
-				if strings.HasPrefix(event.Status, "exec_create:") || strings.HasPrefix(event.Status, "exec_start:") {
-					continue
-				}
-
 				// Because docker emits new events even when you use an old event api
 				// version, it's not that big a deal
 				seelog.Debugf("Unknown status event from docker: %s", event.Status)
