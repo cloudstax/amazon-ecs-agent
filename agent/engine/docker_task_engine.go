@@ -737,7 +737,7 @@ func (engine *DockerTaskEngine) createContainer(task *api.Task, container *api.C
 			return DockerContainerMetadata{Error: api.NamedError(vderr)}
 		}
 
-		seelog.Infof("firecamp volume updated hostConfig Binds %s, VolumeDriver %s", hostConfig.Binds, hostConfig.VolumeDriver)
+		seelog.Infof("firecamp volume updated hostConfig Binds %s, VolumeDriver %s, LogConfig %s, hostConfig %s", hostConfig.Binds, hostConfig.VolumeDriver, hostConfig.LogConfig, hostConfig)
 
 		// Pre-add the container in case we stop before the next, more useful,
 		// AddContainer call. This ensures we have a way to get the container if
