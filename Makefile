@@ -24,6 +24,7 @@ ECS_CNI_REPOSITORY_SRC_DIR=$(PWD)/amazon-ecs-cni-plugins
 
 .PHONY: all gobuild static docker release certs test clean netkitten test-registry run-functional-tests gremlin benchmark-test gogenerate run-integ-tests image-cleanup-test-images pause-container get-cni-sources cni-plugins
 
+org="cloudstax/"
 all: firecampdocker
 
 # Dynamic go build; useful in that it does not have -a so it won't recompile
@@ -59,8 +60,8 @@ docker: certs build-in-docker pause-container-release cni-plugins
 # or not
 firecampdocker: certs build-in-docker pause-container-release cni-plugins
 	@cd scripts && ./create-amazon-ecs-scratch
-	@docker build -f scripts/dockerfiles/Dockerfile.release -t "cloudstax/firecamp-amazon-ecs-agent:latest" .
-	@echo "Built Docker image \"cloudstax/firecamp-amazon-ecs-agent:latest\""
+	@docker build -f scripts/dockerfiles/Dockerfile.release -t "${org}firecamp-amazon-ecs-agent:latest" .
+	@echo "Built Docker image \"${org}firecamp-amazon-ecs-agent:latest\""
 
 
 # 'docker-release' builds the agent from a clean snapshot of the git repo in
