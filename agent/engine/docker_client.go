@@ -1,4 +1,4 @@
-// Copyright 2014-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -45,6 +45,14 @@ const (
 	imageNameFormat = "%s:%s"
 	// the buffer size will ensure agent doesn't miss any event from docker
 	dockerEventBufferSize = 100
+	// healthCheckStarting is the initial status returned from docker container health check
+	healthCheckStarting = "starting"
+	// healthCheckHealthy is the healthy status returned from docker container health check
+	healthCheckHealthy = "healthy"
+	// healthCheckUnhealthy is unhealthy status returned from docker container health check
+	healthCheckUnhealthy = "unhealthy"
+	// maxHealthCheckOutputLength is the maximum length of healthcheck command output that agent will save
+	maxHealthCheckOutputLength = 1024
 )
 
 // Timelimits for docker operations enforced above docker
@@ -202,7 +210,7 @@ func NewDockerGoClient(clientFactory dockerclient.Factory, cfg *config.Config) (
 	client, err := clientFactory.GetDefaultClient()
 
 	if err != nil {
-		log.Error("Unable to connect to docker daemon. Ensure docker is running.", "err", err)
+		seelog.Errorf("DockerGoClient: unable to connect to Docker daemon. Ensure Docker is running: %v", err)
 		return nil, err
 	}
 
@@ -210,7 +218,7 @@ func NewDockerGoClient(clientFactory dockerclient.Factory, cfg *config.Config) (
 	// to ensure it's up.
 	err = client.Ping()
 	if err != nil {
-		log.Error("Unable to ping docker daemon. Ensure docker is running.", "err", err)
+		seelog.Errorf("DockerGoClient: unable to ping Docker daemon. Ensure Docker is running: %v", err)
 		return nil, err
 	}
 
@@ -250,14 +258,16 @@ func (dg *dockerGoClient) PullImage(image string, authData *api.RegistryAuthenti
 
 	response := make(chan DockerContainerMetadata, 1)
 	go func() {
-		imagePullBackoff := utils.NewSimpleBackoff(minimumPullRetryDelay, maximumPullRetryDelay, pullRetryJitterMultiplier, pullRetryDelayMultiplier)
-		err := utils.RetryNWithBackoffCtx(ctx, imagePullBackoff, maximumPullRetries, func() error {
-			err := dg.pullImage(image, authData)
-			if err != nil {
-				seelog.Warnf("Failed to pull image %s: %s", image, err.Error())
-			}
-			return err
-		})
+		imagePullBackoff := utils.NewSimpleBackoff(minimumPullRetryDelay,
+			maximumPullRetryDelay, pullRetryJitterMultiplier, pullRetryDelayMultiplier)
+		err := utils.RetryNWithBackoffCtx(ctx, imagePullBackoff, maximumPullRetries,
+			func() error {
+				err := dg.pullImage(image, authData)
+				if err != nil {
+					seelog.Warnf("DockerGoClient: failed to pull image %s: %s", image, err.Error())
+				}
+				return err
+			})
 		response <- DockerContainerMetadata{Error: wrapPullErrorAsEngineError(err)}
 	}()
 	select {
@@ -282,7 +292,7 @@ func wrapPullErrorAsEngineError(err error) engineError {
 }
 
 func (dg *dockerGoClient) pullImage(image string, authData *api.RegistryAuthenticationData) engineError {
-	log.Debug("Pulling image", "image", image)
+	seelog.Debugf("DockerGoClient: pulling image: %s", image)
 	client, err := dg.dockerClient()
 	if err != nil {
 		return CannotGetDockerClientError{version: dg.version, err: err}
@@ -296,12 +306,7 @@ func (dg *dockerGoClient) pullImage(image string, authData *api.RegistryAuthenti
 	pullDebugOut, pullWriter := io.Pipe()
 	defer pullWriter.Close()
 
-	repository, tag := parseRepositoryTag(image)
-	if tag == "" {
-		repository = repository + ":" + dockerDefaultTag
-	} else {
-		repository = image
-	}
+	repository := getRepository(image)
 
 	opts := docker.PullImageOptions{
 		Repository:   repository,
@@ -311,43 +316,13 @@ func (dg *dockerGoClient) pullImage(image string, authData *api.RegistryAuthenti
 	// pullBegan is a channel indicating that we have seen at least one line of data on the 'OutputStream' above.
 	// It is here to guard against a bug wherin docker never writes anything to that channel and hangs in pulling forever.
 	pullBegan := make(chan bool, 1)
-	// pullBeganOnce ensures we only indicate it began once (since our channel will only be read 0 or 1 times)
-	pullBeganOnce := sync.Once{}
 
-	go func() {
-		reader := bufio.NewReader(pullDebugOut)
-		var line string
-		var pullErr error
-		var statusDisplayed time.Time
-		for pullErr == nil {
-			line, pullErr = reader.ReadString('\n')
-			if pullErr != nil {
-				break
-			}
-			pullBeganOnce.Do(func() {
-				pullBegan <- true
-			})
+	go dg.filterPullDebugOutput(pullDebugOut, pullBegan, image)
 
-			now := time.Now()
-			if !strings.Contains(line, "[=") || now.After(statusDisplayed.Add(pullStatusSuppressDelay)) {
-				// skip most of the progress bar lines, but retain enough for debugging
-				log.Debug("Pulling image", "image", image, "status", line)
-				statusDisplayed = now
-			}
-
-			if strings.Contains(line, "already being pulled by another client. Waiting.") {
-				// This can mean the daemon is 'hung' in pulling status for this image, but we can't be sure.
-				log.Error("Image 'pull' status marked as already being pulled", "image", image, "status", line)
-			}
-		}
-		if pullErr != nil && pullErr != io.EOF {
-			log.Warn("Error reading pull image status", "image", image, "err", pullErr)
-		}
-	}()
 	pullFinished := make(chan error, 1)
 	go func() {
 		pullFinished <- client.PullImage(opts, authConfig)
-		log.Debug("Pulling image complete", "image", image)
+		seelog.Debugf("DockerGoClient: pulling image complete: %s", image)
 	}()
 
 	select {
@@ -361,14 +336,59 @@ func (dg *dockerGoClient) pullImage(image string, authData *api.RegistryAuthenti
 	case <-timeout:
 		return &DockerTimeoutError{dockerPullBeginTimeout, "pullBegin"}
 	}
-	log.Debug("Pull began for image", "image", image)
-	defer log.Debug("Pull completed for image", "image", image)
+	seelog.Debugf("DockerGoClient: pull began for image: %s", image)
+	defer seelog.Debugf("DockerGoClient: pull completed for image: %s", image)
 
 	err = <-pullFinished
 	if err != nil {
 		return CannotPullContainerError{err}
 	}
 	return nil
+}
+
+func (dg *dockerGoClient) filterPullDebugOutput(pullDebugOut *io.PipeReader, pullBegan chan<- bool, image string) {
+	// pullBeganOnce ensures we only indicate it began once (since our channel will only be read 0 or 1 times)
+	pullBeganOnce := sync.Once{}
+
+	reader := bufio.NewReader(pullDebugOut)
+	var line string
+	var pullErr error
+	var statusDisplayed time.Time
+	for {
+		line, pullErr = reader.ReadString('\n')
+		if pullErr != nil {
+			break
+		}
+		pullBeganOnce.Do(func() {
+			pullBegan <- true
+		})
+
+		now := time.Now()
+		if !strings.Contains(line, "[=") || now.After(statusDisplayed.Add(pullStatusSuppressDelay)) {
+			// skip most of the progress bar lines, but retain enough for debugging
+			seelog.Debugf("DockerGoClient: pulling image %s, status %s", image, line)
+			statusDisplayed = now
+		}
+
+		if strings.Contains(line, "already being pulled by another client. Waiting.") {
+			// This can mean the daemon is 'hung' in pulling status for this image, but we can't be sure.
+			seelog.Errorf("DockerGoClient: image 'pull' status marked as already being pulled for image %s, status %s",
+				image, line)
+		}
+	}
+	if pullErr != nil && pullErr != io.EOF {
+		seelog.Warnf("DockerGoClient: error reading pull image status for image %s: %v", image, pullErr)
+	}
+}
+
+func getRepository(image string) string {
+	repository, tag := parseRepositoryTag(image)
+	if tag == "" {
+		repository = repository + ":" + dockerDefaultTag
+	} else {
+		repository = image
+	}
+	return repository
 }
 
 // ImportLocalEmptyVolumeImage imports a locally-generated empty-volume image for supported platforms.
@@ -403,7 +423,7 @@ func (dg *dockerGoClient) createScratchImageIfNotExists() error {
 
 	_, err = client.InspectImage(emptyvolume.Image + ":" + emptyvolume.Tag)
 	if err == nil {
-		seelog.Debug("Empty volume image is already present, skipping import")
+		seelog.Debug("DockerGoClient: empty volume image is already present, skipping import")
 		// Already exists; assume that it's okay to use it
 		return nil
 	}
@@ -416,7 +436,7 @@ func (dg *dockerGoClient) createScratchImageIfNotExists() error {
 		writer.Close()
 	}()
 
-	seelog.Debug("Importing empty volume image")
+	seelog.Debug("DockerGoClient: importing empty volume image")
 	// Create it from an empty tarball
 	err = client.ImportImage(docker.ImportImageOptions{
 		Repository:  emptyvolume.Image,
@@ -447,7 +467,10 @@ func (dg *dockerGoClient) getAuthdata(image string, authData *api.RegistryAuthen
 	return authConfig, nil
 }
 
-func (dg *dockerGoClient) CreateContainer(config *docker.Config, hostConfig *docker.HostConfig, name string, timeout time.Duration) DockerContainerMetadata {
+func (dg *dockerGoClient) CreateContainer(config *docker.Config,
+	hostConfig *docker.HostConfig,
+	name string,
+	timeout time.Duration) DockerContainerMetadata {
 	// Create a context that times out after the 'timeout' duration
 	// This is defined by the const 'createContainerTimeout'. Injecting the 'timeout'
 	// makes it easier to write tests.
@@ -478,7 +501,10 @@ func (dg *dockerGoClient) CreateContainer(config *docker.Config, hostConfig *doc
 	}
 }
 
-func (dg *dockerGoClient) createContainer(ctx context.Context, config *docker.Config, hostConfig *docker.HostConfig, name string) DockerContainerMetadata {
+func (dg *dockerGoClient) createContainer(ctx context.Context,
+	config *docker.Config,
+	hostConfig *docker.HostConfig,
+	name string) DockerContainerMetadata {
 	client, err := dg.dockerClient()
 	if err != nil {
 		return DockerContainerMetadata{Error: CannotGetDockerClientError{version: dg.version, err: err}}
@@ -494,6 +520,7 @@ func (dg *dockerGoClient) createContainer(ctx context.Context, config *docker.Co
 	if err != nil {
 		return DockerContainerMetadata{Error: CannotCreateContainerError{err}}
 	}
+
 	return dg.containerMetadata(dockerContainer.ID)
 }
 
@@ -647,7 +674,7 @@ func (dg *dockerGoClient) stopContainer(ctx context.Context, dockerID string) Do
 	err = client.StopContainerWithContext(dockerID, uint(dg.config.DockerStopTimeout/time.Second), ctx)
 	metadata := dg.containerMetadata(dockerID)
 	if err != nil {
-		log.Debug("Error stopping container", "err", err, "id", dockerID)
+		seelog.Infof("DockerGoClient: error stopping container %s: %v", dockerID, err)
 		if metadata.Error == nil {
 			metadata.Error = CannotStopContainerError{err}
 		}
@@ -709,7 +736,7 @@ func metadataFromContainer(dockerContainer *docker.Container) DockerContainerMet
 		// Convert port bindings into the format our container expects
 		bindings, err = api.PortBindingFromDockerPortBinding(dockerContainer.NetworkSettings.Ports)
 		if err != nil {
-			log.Crit("Docker had network bindings we couldn't understand", "err", err)
+			seelog.Criticalf("DockerGoClient: Docker had network bindings we couldn't understand: %v", err)
 			return DockerContainerMetadata{Error: api.NamedError(err)}
 		}
 	}
@@ -717,6 +744,12 @@ func metadataFromContainer(dockerContainer *docker.Container) DockerContainerMet
 		DockerID:     dockerContainer.ID,
 		PortBindings: bindings,
 		Volumes:      dockerContainer.Volumes,
+		CreatedAt:    dockerContainer.Created,
+		StartedAt:    dockerContainer.State.StartedAt,
+		FinishedAt:   dockerContainer.State.FinishedAt,
+	}
+	if dockerContainer.Config != nil {
+		metadata.Labels = dockerContainer.Config.Labels
 	}
 	// Workaround for https://github.com/docker/docker/issues/27601
 	// See https://github.com/docker/docker/blob/v1.12.2/daemon/inspect_unix.go#L38-L43
@@ -737,7 +770,38 @@ func metadataFromContainer(dockerContainer *docker.Container) DockerContainerMet
 	if dockerContainer.State.OOMKilled {
 		metadata.Error = OutOfMemoryError{}
 	}
+	if dockerContainer.State.Health.Status == "" || dockerContainer.State.Health.Status == healthCheckStarting {
+		return metadata
+	}
 
+	// Record the health check information if exists
+	health := api.HealthStatus{}
+	logLength := len(dockerContainer.State.Health.Log)
+	if logLength != 0 {
+		// Only save the last log from the health check
+		output := dockerContainer.State.Health.Log[logLength-1].Output
+		size := len(output)
+		if size > maxHealthCheckOutputLength {
+			size = maxHealthCheckOutputLength
+		}
+		health.Output = output[:size]
+	}
+
+	switch dockerContainer.State.Health.Status {
+	case healthCheckHealthy:
+		health.Status = api.ContainerHealthy
+	case healthCheckUnhealthy:
+		health.Status = api.ContainerUnhealthy
+		if logLength == 0 {
+			seelog.Warn("DockerGoClient: no container healthcheck data returned by Docker")
+			break
+		}
+		health.ExitCode = dockerContainer.State.Health.Log[logLength-1].ExitCode
+	default:
+		seelog.Debugf("DockerGoClient: unknown healthcheck status event from docker: %s", dockerContainer.State.Health.Status)
+	}
+
+	metadata.Health = health
 	return metadata
 }
 
@@ -753,7 +817,7 @@ func (dg *dockerGoClient) ContainerEvents(ctx context.Context) (<-chan DockerCon
 
 	err = client.AddEventListener(dockerEvents)
 	if err != nil {
-		log.Error("Unable to add a docker event listener", "err", err)
+		seelog.Errorf("DockerGoClient: unable to add a docker event listener: %v", err)
 		return nil, err
 	}
 	go func() {
@@ -767,51 +831,63 @@ func (dg *dockerGoClient) ContainerEvents(ctx context.Context) (<-chan DockerCon
 	go buffer.Consume(events)
 
 	changedContainers := make(chan DockerContainerChangeEvent)
-
-	go func() {
-		for event := range events {
-			containerID := event.ID
-			log.Debug("Got event from docker daemon", "event", event)
-
-			var status api.ContainerStatus
-			switch event.Status {
-			case "create":
-				status = api.ContainerCreated
-			case "start":
-				status = api.ContainerRunning
-			case "stop":
-				fallthrough
-			case "die":
-				status = api.ContainerStopped
-			case "oom":
-				containerInfo := event.ID
-				// events only contain the container's name in newer Docker API
-				// versions (starting with 1.22)
-				if containerName, ok := event.Actor.Attributes["name"]; ok {
-					containerInfo += fmt.Sprintf(" (name: %q)", containerName)
-				}
-
-				seelog.Infof("process within container %s died due to OOM", containerInfo)
-				// "oom" can either means any process got OOM'd, but doesn't always
-				// mean the container dies (non-init processes). If the container also
-				// dies, you see a "die" status as well; we'll update suitably there
-				continue
-			default:
-				// Because docker emits new events even when you use an old event api
-				// version, it's not that big a deal
-				seelog.Debugf("Unknown status event from docker: %s", event.Status)
-			}
-
-			metadata := dg.containerMetadata(containerID)
-
-			changedContainers <- DockerContainerChangeEvent{
-				Status:                  status,
-				DockerContainerMetadata: metadata,
-			}
-		}
-	}()
-
+	go dg.handleContainerEvents(events, changedContainers)
 	return changedContainers, nil
+}
+
+func (dg *dockerGoClient) handleContainerEvents(events <-chan *docker.APIEvents, changedContainers chan<- DockerContainerChangeEvent) {
+	for event := range events {
+		containerID := event.ID
+		seelog.Debugf("DockerGoClient: got event from docker daemon: %v", event)
+
+		var status api.ContainerStatus
+		eventType := api.ContainerStatusEvent
+		switch event.Status {
+		case "create":
+			status = api.ContainerCreated
+			// TODO no need to inspect containers here.
+			// There's no need to inspect containers after they are created when we
+			// adopt Docker's volume APIs. Today, that's the only information we need
+			// from the `inspect` API. Once we start injecting that ourselves,
+			// there's no need to `inspect` containers on `Create` anymore. This will
+			// save us a lot of `inspect` calls in the future.
+		case "start":
+			status = api.ContainerRunning
+		case "stop":
+			fallthrough
+		case "die":
+			status = api.ContainerStopped
+		case "oom":
+			containerInfo := event.ID
+			// events only contain the container's name in newer Docker API
+			// versions (starting with 1.22)
+			if containerName, ok := event.Actor.Attributes["name"]; ok {
+				containerInfo += fmt.Sprintf(" (name: %q)", containerName)
+			}
+
+			seelog.Infof("DockerGoClient: process within container %s died due to OOM", containerInfo)
+			// "oom" can either means any process got OOM'd, but doesn't always
+			// mean the container dies (non-init processes). If the container also
+			// dies, you see a "die" status as well; we'll update suitably there
+			continue
+		case "health_status: healthy":
+			fallthrough
+		case "health_status: unhealthy":
+			eventType = api.ContainerHealthEvent
+		default:
+			// Because docker emits new events even when you use an old event api
+			// version, it's not that big a deal
+			seelog.Debugf("DockerGoClient: unknown status event from docker: %v", event)
+		}
+
+		metadata := dg.containerMetadata(containerID)
+
+		changedContainers <- DockerContainerChangeEvent{
+			Status: status,
+			Type:   eventType,
+			DockerContainerMetadata: metadata,
+		}
+	}
 }
 
 // ListContainers returns a slice of container IDs.
@@ -914,7 +990,8 @@ func (dg *dockerGoClient) Stats(id string, ctx context.Context) (<-chan *docker.
 	go func() {
 		statsErr := client.Stats(options)
 		if statsErr != nil {
-			seelog.Infof("Error retrieving stats for container %s: %v", id, statsErr)
+			seelog.Infof("DockerGoClient: Unable to retrieve stats for container %s: %v",
+				id, statsErr)
 		}
 	}()
 

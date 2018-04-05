@@ -57,7 +57,9 @@ const (
 	//   b) Add `executionCredentialsID` in `api.Task`
 	//   c) Add 'LogsAuthStrategy' field to 'api.Container'
 	//   d) Added task cgroup related fields ('CPU', 'Memory', 'MemoryCPULimitsEnabled') to 'api.Task'
-	ECSDataVersion = 8
+	// 9) Add 'ipToTask' map to state file
+	// 10) Add 'healthCheckType' field in 'api.Container'
+	ECSDataVersion = 10
 
 	// ecsDataFile specifies the filename in the ECS_DATADIR
 	ecsDataFile = "ecs_agent_data.json"
@@ -92,7 +94,7 @@ type intermediateSaveableState map[string]json.RawMessage
 // Note, changing this to work with BinaryMarshaler or another more compact
 // format would be fine, but everything already needs a json representation
 // since that's our wire format and the extra space taken / IO-time is expected
-// to be fairly negligable.
+// to be fairly negligible.
 type state struct {
 	Data saveableState
 

@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	acsclient "github.com/aws/amazon-ecs-agent/agent/acs/client"
 	"github.com/aws/amazon-ecs-agent/agent/acs/model/ecsacs"
@@ -74,7 +74,7 @@ type Session interface {
 }
 
 // session encapsulates all arguments needed by the handler to connect to ACS
-// and to handle messages recieved by ACS. The Session.Start() method can be used
+// and to handle messages received by ACS. The Session.Start() method can be used
 // to start processing messages from ACS.
 type session struct {
 	containerInstanceARN            string

@@ -1,5 +1,5 @@
 // +build !integration
-// Copyright 2014-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -24,12 +24,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	docker "github.com/fsouza/go-dockerclient"
-	"github.com/golang/mock/gomock"
-	"github.com/stretchr/testify/assert"
-	"golang.org/x/net/context"
-
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/credentials"
@@ -41,6 +35,12 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockeriface/mocks"
 	"github.com/aws/amazon-ecs-agent/agent/engine/emptyvolume"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ttime/mocks"
+
+	"context"
+	"github.com/aws/aws-sdk-go/aws"
+	docker "github.com/fsouza/go-dockerclient"
+	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -109,11 +109,12 @@ func TestPullImageOutputTimeout(t *testing.T) {
 	wait := sync.WaitGroup{}
 	wait.Add(1)
 	// multiple invocations will happen due to retries, but all should timeout
-	mockDocker.EXPECT().PullImage(&pullImageOptsMatcher{"image:latest"}, gomock.Any()).Do(func(x, y interface{}) {
-		pullBeginTimeout <- time.Now()
-		wait.Wait()
-		// Don't return, verify timeout happens
-	}).Times(maximumPullRetries) // expected number of retries
+	mockDocker.EXPECT().PullImage(&pullImageOptsMatcher{"image:latest"}, gomock.Any()).Do(
+		func(x, y interface{}) {
+			pullBeginTimeout <- time.Now()
+			wait.Wait()
+			// Don't return, verify timeout happens
+		}).Times(maximumPullRetries) // expected number of retries
 
 	metadata := client.PullImage("image", nil)
 	if metadata.Error == nil {
@@ -295,6 +296,20 @@ func TestPullImageECRAuthFail(t *testing.T) {
 	assert.Error(t, metadata.Error, "expected pull to fail")
 }
 
+func TestGetRepositoryWithTaggedImage(t *testing.T) {
+	image := "registry.endpoint/myimage:tag"
+	respository := getRepository(image)
+
+	assert.Equal(t, image, respository)
+}
+
+func TestGetRepositoryWithUntaggedImage(t *testing.T) {
+	image := "registry.endpoint/myimage"
+	respository := getRepository(image)
+
+	assert.Equal(t, image+":"+dockerDefaultTag, respository)
+}
+
 func TestImportLocalEmptyVolumeImage(t *testing.T) {
 	mockDocker, client, testTime, _, _, done := dockerClientSetup(t)
 	defer done()
@@ -340,7 +355,9 @@ func TestCreateContainerTimeout(t *testing.T) {
 		warp <- time.Now()
 		wait.Wait()
 		// Don't return, verify timeout happens
-	})
+		// TODO remove the MaxTimes by cancel the context passed to CreateContainer
+		// when issue #1212 is resolved
+	}).MaxTimes(1)
 	metadata := client.CreateContainer(config.Config, nil, config.Name, xContainerShortTimeout)
 	assert.Error(t, metadata.Error, "expected error for pull timeout")
 	assert.Equal(t, "DockerTimeoutError", metadata.Error.(api.NamedError).ErrorName())
@@ -507,7 +524,18 @@ func TestInspectContainer(t *testing.T) {
 	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
-	containerOutput := docker.Container{ID: "id", State: docker.State{ExitCode: 10}}
+	containerOutput := docker.Container{ID: "id",
+		State: docker.State{
+			ExitCode: 10,
+			Health: docker.Health{
+				Status: "healthy",
+				Log: []docker.HealthCheck{
+					{
+						ExitCode: 1,
+						Output:   "health output",
+					},
+				},
+			}}}
 	gomock.InOrder(
 		mockDocker.EXPECT().InspectContainerWithContext("id", gomock.Any()).Return(&containerOutput, nil),
 	)
@@ -530,9 +558,7 @@ func TestContainerEvents(t *testing.T) {
 	})
 
 	dockerEvents, err := client.ContainerEvents(context.TODO())
-	if err != nil {
-		t.Fatal("Could not get container events")
-	}
+	require.NoError(t, err, "Could not get container events")
 
 	mockDocker.EXPECT().InspectContainerWithContext("containerId", gomock.Any()).Return(
 		&docker.Container{
@@ -544,12 +570,8 @@ func TestContainerEvents(t *testing.T) {
 	}()
 
 	event := <-dockerEvents
-	if event.DockerID != "containerId" {
-		t.Error("Wrong docker id")
-	}
-	if event.Status != api.ContainerCreated {
-		t.Error("Wrong status")
-	}
+	assert.Equal(t, event.DockerID, "containerId", "Wrong docker id")
+	assert.Equal(t, event.Status, api.ContainerCreated, "Wrong status")
 
 	container := &docker.Container{
 		ID: "cid2",
@@ -565,18 +587,11 @@ func TestContainerEvents(t *testing.T) {
 		events <- &docker.APIEvents{Type: "container", ID: "cid2", Status: "start"}
 	}()
 	event = <-dockerEvents
-	if event.DockerID != "cid2" {
-		t.Error("Wrong docker id")
-	}
-	if event.Status != api.ContainerRunning {
-		t.Error("Wrong status")
-	}
-	if event.PortBindings[0].ContainerPort != 80 || event.PortBindings[0].HostPort != 9001 {
-		t.Error("Incorrect port bindings")
-	}
-	if event.Volumes["/host/path"] != "/container/path" {
-		t.Error("Incorrect volume mapping")
-	}
+	assert.Equal(t, event.DockerID, "cid2", "Wrong docker id")
+	assert.Equal(t, event.Status, api.ContainerRunning, "Wrong status")
+	assert.Equal(t, event.PortBindings[0].ContainerPort, uint16(80), "Incorrect port bindings")
+	assert.Equal(t, event.PortBindings[0].HostPort, uint16(9001), "Incorrect port bindings")
+	assert.Equal(t, event.Volumes["/host/path"], "/container/path", "Incorrect volume mapping")
 
 	for i := 0; i < 2; i++ {
 		stoppedContainer := &docker.Container{
@@ -595,16 +610,42 @@ func TestContainerEvents(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		anEvent := <-dockerEvents
-		if anEvent.DockerID != "cid30" && anEvent.DockerID != "cid31" {
-			t.Error("Wrong container id: " + anEvent.DockerID)
-		}
-		if anEvent.Status != api.ContainerStopped {
-			t.Error("Should be stopped")
-		}
-		if *anEvent.ExitCode != 20 {
-			t.Error("Incorrect exit code")
-		}
+		assert.True(t, anEvent.DockerID == "cid30" || anEvent.DockerID == "cid31", "Wrong container id: "+anEvent.DockerID)
+		assert.Equal(t, anEvent.Status, api.ContainerStopped, "Should be stopped")
+		assert.Equal(t, aws.IntValue(anEvent.ExitCode), 20, "Incorrect exit code")
 	}
+
+	containerWithHealthInfo := &docker.Container{
+		ID: "container_health",
+		State: docker.State{
+			Health: docker.Health{
+				Status: "healthy",
+				Log: []docker.HealthCheck{
+					{
+						ExitCode: 1,
+						Output:   "health output",
+					},
+				},
+			},
+		},
+	}
+	mockDocker.EXPECT().InspectContainerWithContext("container_health", gomock.Any()).Return(containerWithHealthInfo, nil)
+	go func() {
+		events <- &docker.APIEvents{
+			Type:   "container",
+			ID:     "container_health",
+			Action: "health_status: unhealthy",
+			Status: "health_status: unhealthy",
+			Actor: docker.APIActor{
+				ID: "container_health",
+			},
+		}
+	}()
+
+	anEvent := <-dockerEvents
+	assert.Equal(t, anEvent.Type, api.ContainerHealthEvent, "unexpected docker events type received")
+	assert.Equal(t, anEvent.Health.Status, api.ContainerHealthy)
+	assert.Equal(t, anEvent.Health.Output, "health output")
 
 	// Verify the following events do not translate into our event stream
 
@@ -930,6 +971,8 @@ func TestRemoveImage(t *testing.T) {
 	}
 }
 
+// TestContainerMetadataWorkaroundIssue27601 tests the workaround for
+// issue https://github.com/moby/moby/issues/27601
 func TestContainerMetadataWorkaroundIssue27601(t *testing.T) {
 	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
@@ -1077,7 +1120,7 @@ func TestECRAuthCacheForDifferentRegistry(t *testing.T) {
 }
 
 // TestECRAuthCacheWithExecutionRole tests the client will use the cached docker auth
-// for ecr when pull from the same registery with same execution role
+// for ecr when pull from the same registry with same execution role
 func TestECRAuthCacheWithSameExecutionRole(t *testing.T) {
 	mockDocker, client, mockTime, ctrl, ecrClientFactory, done := dockerClientSetup(t)
 	defer done()
@@ -1127,7 +1170,7 @@ func TestECRAuthCacheWithSameExecutionRole(t *testing.T) {
 }
 
 // TestECRAuthCacheWithDifferentExecutionRole tests client will call ecr client to get
-// docker auth credentails for different execution role
+// docker auth credentials for different execution role
 func TestECRAuthCacheWithDifferentExecutionRole(t *testing.T) {
 	mockDocker, client, mockTime, ctrl, ecrClientFactory, done := dockerClientSetup(t)
 	defer done()
@@ -1180,4 +1223,62 @@ func TestECRAuthCacheWithDifferentExecutionRole(t *testing.T) {
 		}, nil).Times(1)
 	metadata = client.PullImage(image, authData)
 	assert.NoError(t, metadata.Error, "Expected pull to succeed")
+}
+
+func TestMetadataFromContainer(t *testing.T) {
+	ports := map[docker.Port][]docker.PortBinding{
+		docker.Port("80/tcp"): []docker.PortBinding{
+			{
+				HostIP:   "0.0.0.0",
+				HostPort: "80",
+			},
+		},
+	}
+	volumes := map[string]string{
+		"/foo": "/bar",
+	}
+	labels := map[string]string{
+		"name": "metadata",
+	}
+
+	created := time.Now()
+	started := time.Now()
+	finished := time.Now()
+
+	dockerContainer := &docker.Container{
+		NetworkSettings: &docker.NetworkSettings{
+			Ports: ports,
+		},
+		ID:      "1234",
+		Volumes: volumes,
+		Config: &docker.Config{
+			Labels: labels,
+		},
+		Created: created,
+		State: docker.State{
+			Running:    true,
+			StartedAt:  started,
+			FinishedAt: finished,
+		},
+	}
+
+	metadata := metadataFromContainer(dockerContainer)
+	assert.Equal(t, "1234", metadata.DockerID)
+	assert.Equal(t, volumes, metadata.Volumes)
+	assert.Equal(t, labels, metadata.Labels)
+	assert.Len(t, metadata.PortBindings, 1)
+	assert.Equal(t, created, metadata.CreatedAt)
+	assert.Equal(t, started, metadata.StartedAt)
+	assert.Equal(t, finished, metadata.FinishedAt)
+}
+
+func TestMetadataFromContainerHealthCheckWithNoLogs(t *testing.T) {
+
+	dockerContainer := &docker.Container{
+		State: docker.State{
+			Health: docker.Health{Status: "unhealthy"},
+		}}
+
+	metadata := metadataFromContainer(dockerContainer)
+	assert.Equal(t, api.ContainerUnhealthy, metadata.Health.Status)
 }

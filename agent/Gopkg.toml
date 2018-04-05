@@ -27,7 +27,7 @@
 
 [[constraint]]
   name = "github.com/cihub/seelog"
-  revision ="0fa7e41d2b9600ca6b7e1592478124e4f800f724"
+  version ="2.6"
 
 [[constraint]]
   name = "github.com/containerd/cgroups"
@@ -85,3 +85,7 @@
 
 [[constraint]]
   name = "golang.org/x/tools"
+
+[[constraint]]
+  name = "github.com/didip/tollbooth"
+  version = "3.0.2"

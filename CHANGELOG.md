@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.17.2
+* Enhancement - Update the `amazon-ecs-cni-plugins` to `2018.02.0` [#1272](https://github.com/aws/amazon-ecs-agent/pull/1272)
+* Enhancement - Add container port mapping and ENI information in introspection
+API [#1271](https://github.com/aws/amazon-ecs-agent/pull/1271)
+
+## 1.17.1
+* Bug - Fixed a bug that was causing a runtime panic by accessing negative
+  index in the health check log slice [#1239](https://github.com/aws/amazon-ecs-agent/pull/1239)
+* Bug - Workaround for an issue where CPU percent was set to 1 when CPU was not
+  set or set to zero(unbounded) in Windows [#1227](https://github.com/aws/amazon-ecs-agent/pull/1227)
+* Bug - Fixed a bug where steady state throttle limits for task metadata endpoints
+  were too low for applications [#1240](https://github.com/aws/amazon-ecs-agent/pull/1240)
+
+## 1.17.0
+* Feature - Support a HTTP endpoint for `awsvpc` tasks to query metadata
+* Feature - Support Docker health check
+* Bug - Fixed a bug where `-version` fails due to its dependency on docker
+  client [#1118](https://github.com/aws/amazon-ecs-agent/pull/1118)
+* Bug - Persist container exit code in agent state file
+  [#1125](https://github.com/aws/amazon-ecs-agent/pull/1125)
+* Bug - Fixed a bug where the agent could lose track of running containers when
+  Docker APIs timeout [#1217](https://github.com/aws/amazon-ecs-agent/pull/1217)
+* Bug - Task level memory.use_hierarchy was not being set and memory limits
+  were not being enforced [#1195](https://github.com/aws/amazon-ecs-agent/pull/1195)
+* Bug - Fixed a bug where CPU utilization wasn't correctly reported on Windows
+  [@bboerst](https://github.com/bboerst) [#1219](https://github.com/aws/amazon-ecs-agent/pull/1219)
+
 ## 1.16.2
 * Bug - Fixed a bug where the ticker would submit empty container state change
   transitions when a task is STOPPED. [#1178](https://github.com/aws/amazon-ecs-agent/pull/1178)

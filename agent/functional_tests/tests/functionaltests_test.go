@@ -1,6 +1,6 @@
 // +build functional
 
-// Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -16,6 +16,7 @@
 package functional_tests
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"reflect"
@@ -26,6 +27,8 @@ import (
 	ecsapi "github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	. "github.com/aws/amazon-ecs-agent/agent/functional_tests/util"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -35,6 +38,11 @@ const (
 	waitTaskStateChangeDuration     = 2 * time.Minute
 	waitMetricsInCloudwatchDuration = 4 * time.Minute
 	awslogsLogGroupName             = "ecs-functional-tests"
+
+	// 'awsvpc' test parameters
+	awsvpcTaskDefinition     = "nginx-awsvpc"
+	awsvpcIPv4AddressKey     = "privateIPv4Address"
+	awsvpcTaskRequestTimeout = 5 * time.Second
 )
 
 // TestPullInvalidImage verifies that an invalid image returns an error
@@ -61,7 +69,7 @@ func TestSavedState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = testTask.WaitRunning(1 * time.Minute)
+	err = testTask.WaitRunning(waitTaskStateChangeDuration)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +94,7 @@ func TestSavedState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	testTask.WaitStopped(1 * time.Minute)
+	testTask.WaitStopped(waitTaskStateChangeDuration)
 }
 
 // TestSavedStateWithInvalidImageAndCleanup verifies that a task definition with an invalid image does not prevent the
@@ -268,8 +276,8 @@ func TestTaskCleanup(t *testing.T) {
 	}
 }
 
-// TestNetworkModeBridge tests the container network can be configured
-// as none mode in task definition
+// TestNetworkModeNone tests if the 'none' contaienr network mode is configured
+// correctly in task definition
 func TestNetworkModeNone(t *testing.T) {
 	agent := RunAgent(t, nil)
 	defer agent.Cleanup()
@@ -280,7 +288,6 @@ func TestNetworkModeNone(t *testing.T) {
 	}
 }
 
-// TestNetworkMode tests the contaienr network mode is configured in task definition correctly
 func networkModeTest(t *testing.T, agent *TestAgent, mode string) error {
 	tdOverride := make(map[string]string)
 
@@ -298,7 +305,7 @@ func networkModeTest(t *testing.T, agent *TestAgent, mode string) error {
 	}
 	containerId, err := agent.ResolveTaskDockerID(task, "network-"+mode)
 	if err != nil {
-		return fmt.Errorf("error resolving docker id for container \"network-none\": %v", err)
+		return fmt.Errorf("error resolving docker id for container \"network-%s\": %v", mode, err)
 	}
 
 	networks, err := agent.GetContainerNetworkMode(containerId)
@@ -311,6 +318,29 @@ func networkModeTest(t *testing.T, agent *TestAgent, mode string) error {
 	if networks[0] != mode {
 		return fmt.Errorf("did not found the expected network mode")
 	}
+	return nil
+}
+
+// awsvpcNetworkModeTest tests if the 'awsvpc' network mode works properly
+func awsvpcNetworkModeTest(t *testing.T, agent *TestAgent) error {
+	// Start task with network mode set to 'awsvpc'
+	task, err := agent.StartAWSVPCTask(awsvpcTaskDefinition, nil)
+	if err != nil {
+		return fmt.Errorf("unable to start task with 'awsvpc' network mode: %v", err)
+	}
+	defer func() {
+		if err := task.Stop(); err != nil {
+			return
+		}
+		task.WaitStopped(2 * time.Minute)
+	}()
+
+	// Wait for task to be running
+	err = task.WaitRunning(waitTaskStateChangeDuration)
+	if err != nil {
+		return fmt.Errorf("error waiting for task running, err: %v", err)
+	}
+
 	return nil
 }
 
@@ -359,16 +389,77 @@ func TestCustomAttributesWithMaxOptions(t *testing.T) {
 	assert.True(t, ok, "OS attribute not found")
 }
 
+func waitForContainerHealthStatus(t *testing.T, testTask *TestTask) {
+	ctx, _ := context.WithTimeout(context.TODO(), waitTaskStateChangeDuration)
+	for {
+		select {
+		case <-ctx.Done():
+			t.Error("Timed out waiting for container health status")
+		default:
+			testTask.Redescribe()
+			if aws.StringValue(testTask.Containers[0].HealthStatus) == "UNKNOWN" {
+				time.Sleep(time.Second)
+				continue
+			}
+			return
+		}
+	}
+}
+
+func containerHealthWithoutStartPeriodTest(t *testing.T, taskDefinition string) {
+	RequireDockerVersion(t, ">=1.12.0") // container health check was added in Docker 1.12.0
+	// StartPeriod of container health check was added in 17.05.0,
+	// don't test it here, it should be tested in containerHealthWithStartPeriodTest
+	RequireDockerVersion(t, "<17.05.0")
+
+	tdOverrides := map[string]string{
+		"$$$$START_PERIOD$$$$": "",
+	}
+
+	containerHealthMetricsTest(t, taskDefinition, tdOverrides)
+}
+
+func containerHealthWithStartPeriodTest(t *testing.T, taskDefinition string) {
+	RequireDockerVersion(t, ">=17.05.0") // StartPeriod of container health check was added in 17.05.0
+
+	tdOverrides := map[string]string{
+		"$$$$START_PERIOD$$$$": `"startPeriod": 1,`,
+	}
+
+	containerHealthMetricsTest(t, taskDefinition, tdOverrides)
+}
+
+// containerHealthMetricsTest tests the container health metrics based on the task definition
+func containerHealthMetricsTest(t *testing.T, taskDefinition string, overrides map[string]string) {
+	agent := RunAgent(t, nil)
+	defer agent.Cleanup()
+
+	agent.RequireVersion(">1.16.2") //Required for container health check option
+
+	testTask, err := agent.StartTaskWithTaskDefinitionOverrides(t, taskDefinition, overrides)
+	require.NoError(t, err, "expect task to be started without error")
+
+	testTask.WaitRunning(waitTaskStateChangeDuration)
+
+	waitForContainerHealthStatus(t, testTask)
+	assert.Equal(t, aws.StringValue(testTask.Containers[0].HealthStatus), "HEALTHY", "container health status is not HEALTHY")
+	err = testTask.Stop()
+	assert.NoError(t, err, "stop task failed")
+	err = testTask.WaitStopped(waitTaskStateChangeDuration)
+	assert.NoError(t, err, "waiting for task stopped failed")
+}
+
 // waitCloudwatchLogs wait until the logs has been sent to cloudwatchlogs
 func waitCloudwatchLogs(client *cloudwatchlogs.CloudWatchLogs, params *cloudwatchlogs.GetLogEventsInput) (*cloudwatchlogs.GetLogEventsOutput, error) {
 	// The test could fail for timing issue, so retry for 30 seconds to make this test more stable
 	for i := 0; i < 30; i++ {
 		resp, err := client.GetLogEvents(params)
 		if err != nil {
-			return nil, err
-		}
-
-		if len(resp.Events) > 0 {
+			awsError, ok := err.(awserr.Error)
+			if !ok || awsError.Code() != "ResourceNotFoundException" {
+				return nil, err
+			}
+		} else if len(resp.Events) > 0 {
 			return resp, nil
 		}
 		time.Sleep(time.Second)

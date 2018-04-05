@@ -34,10 +34,30 @@ type ENI struct {
 	MacAddress string
 	// DomainNameServers specifies the nameserver IP addresses for
 	// the eni
-	DomainNameServers []string `json:"omitempty"`
+	DomainNameServers []string `json:",omitempty"`
 	// DomainNameSearchList specifies the search list for the domain
 	// name lookup, for the eni
-	DomainNameSearchList []string `json:"omitempty"`
+	DomainNameSearchList []string `json:",omitempty"`
+}
+
+// GetIPV4Addresses returns a list of ipv4 addresses allocated to the ENI
+func (eni *ENI) GetIPV4Addresses() []string {
+	var addresses []string
+	for _, addr := range eni.IPV4Addresses {
+		addresses = append(addresses, addr.Address)
+	}
+
+	return addresses
+}
+
+// GetIPV6Addresses returns a list of ipv6 addresses allocated to the ENI
+func (eni *ENI) GetIPV6Addresses() []string {
+	var addresses []string
+	for _, addr := range eni.IPV6Addresses {
+		addresses = append(addresses, addr.Address)
+	}
+
+	return addresses
 }
 
 // String returns a human readable version of the ENI object
