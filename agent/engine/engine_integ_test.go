@@ -1,5 +1,5 @@
 // +build integration
-// Copyright 2014-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -15,14 +15,14 @@
 package engine
 
 import (
+	"context"
 	"io/ioutil"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"context"
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/config"
@@ -42,6 +42,12 @@ import (
 const (
 	testDockerStopTimeout  = 2 * time.Second
 	credentialsIDIntegTest = "credsid"
+	containerPortOne       = 24751
+	containerPortTwo       = 24752
+	serverContent          = "ecs test container"
+	dialTimeout            = 200 * time.Millisecond
+	localhost              = "127.0.0.1"
+	waitForDockerDuration  = 50 * time.Millisecond
 )
 
 func init() {
@@ -66,10 +72,14 @@ func defaultTestConfigIntegTest() *config.Config {
 }
 
 func setupWithDefaultConfig(t *testing.T) (TaskEngine, func(), credentials.Manager) {
-	return setup(defaultTestConfigIntegTest(), t)
+	return setup(defaultTestConfigIntegTest(), nil, t)
 }
 
-func setup(cfg *config.Config, t *testing.T) (TaskEngine, func(), credentials.Manager) {
+func setupWithState(t *testing.T, state dockerstate.TaskEngineState) (TaskEngine, func(), credentials.Manager) {
+	return setup(defaultTestConfigIntegTest(), state, t)
+}
+
+func setup(cfg *config.Config, state dockerstate.TaskEngineState, t *testing.T) (TaskEngine, func(), credentials.Manager) {
 	if os.Getenv("ECS_SKIP_ENGINE_INTEG_TEST") != "" {
 		t.Skip("ECS_SKIP_ENGINE_INTEG_TEST")
 	}
@@ -82,7 +92,9 @@ func setup(cfg *config.Config, t *testing.T) (TaskEngine, func(), credentials.Ma
 		t.Fatalf("Error creating Docker client: %v", err)
 	}
 	credentialsManager := credentials.NewManager()
-	state := dockerstate.NewTaskEngineState()
+	if state == nil {
+		state = dockerstate.NewTaskEngineState()
+	}
 	imageManager := NewImageManager(cfg, dockerClient, state)
 	imageManager.SetSaver(statemanager.NewNoopStateManager())
 	metadataManager := containermetadata.NewManager(dockerClient, cfg)
@@ -123,6 +135,25 @@ func verifyTaskStoppedStateChange(t *testing.T, taskEngine TaskEngine) {
 	event := <-stateChangeEvents
 	assert.Equal(t, event.(api.TaskStateChange).Status, api.TaskStopped,
 		"Expected task to be STOPPED")
+}
+
+func dialWithRetries(proto string, address string, tries int, timeout time.Duration) (net.Conn, error) {
+	var err error
+	var conn net.Conn
+	for i := 0; i < tries; i++ {
+		conn, err = net.DialTimeout(proto, address, timeout)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return conn, err
+}
+
+func removeImage(t *testing.T, img string) {
+	client, err := docker.NewClient(endpoint)
+	require.NoError(t, err, "create docker client failed")
+	client.RemoveImage(img)
 }
 
 // TestDockerStateToContainerState tests convert the container status from
@@ -224,7 +255,7 @@ func TestSweepContainer(t *testing.T) {
 	cfg := defaultTestConfigIntegTest()
 	cfg.TaskCleanupWaitDuration = 1 * time.Minute
 	cfg.ContainerMetadataEnabled = true
-	taskEngine, done, _ := setup(cfg, t)
+	taskEngine, done, _ := setup(cfg, nil, t)
 	defer done()
 
 	taskArn := "arn:aws:ecs:us-east-1:123456789012:task/testSweepContainer"
@@ -283,4 +314,107 @@ func TestStartStopWithCredentials(t *testing.T) {
 	// credentials id set in the task
 	_, ok := credentialsManager.GetTaskCredentials(credentialsIDIntegTest)
 	assert.False(t, ok, "Credentials not removed from credentials manager for stopped task")
+}
+
+func TestContainerHealthCheck(t *testing.T) {
+	taskEngine, done, _ := setupWithDefaultConfig(t)
+	defer done()
+
+	stateChangeEvents := taskEngine.StateChangeEvents()
+
+	taskArn := "testTaskWithHealthCheck"
+	testTask := createTestHealthCheckTask(taskArn)
+
+	go taskEngine.AddTask(testTask)
+
+	verifyContainerRunningStateChange(t, taskEngine)
+	verifyTaskIsRunning(stateChangeEvents, testTask)
+
+	waitForContainerHealthStatus(t, testTask)
+	healthStatus := testTask.Containers[0].GetHealthStatus()
+	assert.Equal(t, "HEALTHY", healthStatus.Status.BackendStatus(), "container health status is not HEALTHY")
+
+	taskUpdate := createTestTask(taskArn)
+	taskUpdate.SetDesiredStatus(api.TaskStopped)
+	go taskEngine.AddTask(taskUpdate)
+
+	verifyContainerStoppedStateChange(t, taskEngine)
+	verifyTaskIsStopped(stateChangeEvents, testTask)
+}
+
+// TestEngineSynchronize tests the agent synchronize the container status on restart
+func TestEngineSynchronize(t *testing.T) {
+	taskEngine, done, _ := setupWithDefaultConfig(t)
+
+	taskArn := "arn:aws:ecs:us-east-1:123456789012:task/testEngineSynchronize"
+	testTask := createTestTask(taskArn)
+	testTask.Containers[0].Image = testVolumeImage
+
+	// Start a task
+	go taskEngine.AddTask(testTask)
+	verifyContainerRunningStateChange(t, taskEngine)
+	verifyTaskRunningStateChange(t, taskEngine)
+	// Record the container information
+	state := taskEngine.(*DockerTaskEngine).State()
+	containersMap, ok := state.ContainerMapByArn(taskArn)
+	require.True(t, ok, "no container found in the agent state")
+	require.Len(t, containersMap, 1)
+	containerIDs := state.GetAllContainerIDs()
+	require.Len(t, containerIDs, 1)
+	imageStates := state.AllImageStates()
+	assert.Len(t, imageStates, 1)
+	taskEngine.(*DockerTaskEngine).stopEngine()
+
+	containerBeforeSync, ok := containersMap[testTask.Containers[0].Name]
+	assert.True(t, ok, "container not found in the containers map")
+	// Task and Container restored from state file
+	containerSaved := &api.Container{
+		Name:                containerBeforeSync.Container.Name,
+		SentStatusUnsafe:    api.ContainerRunning,
+		DesiredStatusUnsafe: api.ContainerRunning,
+	}
+	task := &api.Task{
+		Arn: taskArn,
+		Containers: []*api.Container{
+			containerSaved,
+		},
+		KnownStatusUnsafe:   api.TaskRunning,
+		DesiredStatusUnsafe: api.TaskRunning,
+		SentStatusUnsafe:    api.TaskRunning,
+	}
+
+	state = dockerstate.NewTaskEngineState()
+	state.AddTask(task)
+	state.AddContainer(&api.DockerContainer{
+		DockerID:  containerBeforeSync.DockerID,
+		Container: containerSaved,
+	}, task)
+	state.AddImageState(imageStates[0])
+
+	// Simulate the agent restart
+	taskEngine, done, _ = setupWithState(t, state)
+	defer done()
+
+	taskEngine.MustInit(context.TODO())
+
+	// Check container status/metadata and image information are correctly synchronized
+	containerIDAfterSync := state.GetAllContainerIDs()
+	require.Len(t, containerIDAfterSync, 1)
+	containerAfterSync, ok := state.ContainerByID(containerIDAfterSync[0])
+	assert.True(t, ok, "no container found in the agent state")
+
+	assert.Equal(t, containerAfterSync.Container.GetKnownStatus(), containerBeforeSync.Container.GetKnownStatus())
+	assert.Equal(t, containerAfterSync.Container.GetLabels(), containerBeforeSync.Container.GetLabels())
+	assert.Equal(t, containerAfterSync.Container.GetStartedAt(), containerBeforeSync.Container.GetStartedAt())
+	assert.Equal(t, containerAfterSync.Container.GetCreatedAt(), containerBeforeSync.Container.GetCreatedAt())
+
+	imageStateAfterSync := state.AllImageStates()
+	assert.Len(t, imageStateAfterSync, 1)
+	assert.Equal(t, *imageStateAfterSync[0], *imageStates[0])
+
+	testTask.SetDesiredStatus(api.TaskStopped)
+	go taskEngine.AddTask(testTask)
+
+	verifyContainerStoppedStateChange(t, taskEngine)
+	verifyTaskStoppedStateChange(t, taskEngine)
 }
